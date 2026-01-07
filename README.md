@@ -64,7 +64,46 @@ pycandle record --script model_script.py --name my_model --out traces/
 Generate Candle Rust code from a manifest.
 
 ```bash
-pycandle codegen --manifest traces/my_model_manifest.json --out generated.rs --model ModelName
+pycandle codegen --manifest traces/manifest.json --out generated.rs --model ModelName
+```
+
+**Flags:**
+- `--analyze-only` - Show analysis without generating code
+- `--json` - Output as JSON (works with all commands)
+
+**Analysis mode example:**
+```bash
+# Human-readable analysis
+pycandle codegen --manifest m.json --out NUL --analyze-only
+
+# JSON output for scripting
+pycandle codegen --manifest m.json --out NUL --analyze-only --json
+```
+
+### `pycandle todos`
+Extract and manage TODO markers in generated code.
+
+```bash
+# List all TODOs with suggestions
+pycandle todos --file generated_model.rs
+
+# JSON output
+pycandle todos --file generated_model.rs --json
+
+# Check mode (exit code 1 if TODOs remain)
+pycandle todos --file generated_model.rs --check
+```
+
+**Agent workflow example:**
+```bash
+# 1. Generate code
+pycandle codegen --manifest m.json --out model.rs --model MyModel
+
+# 2. Check for TODOs
+if ! pycandle todos --file model.rs --check; then
+    # 3. Get gaps as JSON and implement
+    pycandle todos --file model.rs --json | jq '.by_type'
+fi
 ```
 
 ## Python Spy API
@@ -132,8 +171,9 @@ impl MyModel {
 | `nn.Conv1d` | `candle_nn::conv1d` | ✅ Auto |
 | `nn.Embedding` | `candle_nn::embedding` | ✅ Auto |
 | `nn.LayerNorm` | `candle_nn::layer_norm` | ✅ Auto |
-| `nn.LSTM` | - | ⚠️ TODO marker |
-| `nn.BatchNorm*` | - | ⚠️ TODO marker |
+| `nn.BatchNorm1d` | `BatchNorm1d` | ✅ Auto |
+| `nn.BatchNorm2d` | `BatchNorm2d` | ✅ Auto |
+| `nn.LSTM` | `LSTM` | ✅ Auto |
 | Custom modules | - | ⚠️ TODO marker |
 
 ## Project Structure
@@ -141,11 +181,14 @@ impl MyModel {
 ```
 pycandle/
 ├── src/
-│   ├── main.rs      # CLI
-│   ├── lib.rs       # PyChecker, py_check! macro
-│   └── codegen.rs   # Manifest → Rust code generator
+│   ├── main.rs          # CLI entry point
+│   ├── lib.rs           # PyChecker, py_check! macro, layer implementations
+│   ├── todos.rs         # TODO extraction from generated code
+│   └── codegen/
+│       ├── mod.rs       # Manifest → Rust code generator
+│       └── gpt2.rs      # GPT2-specific helpers
 ├── py/
-│   └── spy.py       # GoldenRecorder
+│   └── spy.py           # GoldenRecorder
 └── Cargo.toml
 ```
 

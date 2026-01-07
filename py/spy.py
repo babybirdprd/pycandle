@@ -44,6 +44,31 @@ class GoldenRecorder:
             cfg = {"normalized_shape": list(module.normalized_shape), "eps": module.eps}
         elif isinstance(module, nn.Embedding):
             cfg = {"num_embeddings": module.num_embeddings, "embedding_dim": module.embedding_dim}
+        # Activation functions
+        elif isinstance(module, nn.ELU):
+            cfg = {"alpha": module.alpha}
+        elif isinstance(module, nn.LeakyReLU):
+            cfg = {"negative_slope": module.negative_slope}
+        elif isinstance(module, nn.BatchNorm1d):
+            cfg = {"num_features": module.num_features, "eps": module.eps}
+        elif isinstance(module, nn.BatchNorm2d):
+            cfg = {"num_features": module.num_features, "eps": module.eps}
+        elif isinstance(module, nn.LSTM):
+            cfg = {
+                "input_size": module.input_size,
+                "hidden_size": module.hidden_size,
+                "num_layers": module.num_layers,
+                "batch_first": module.batch_first,
+                "bidirectional": module.bidirectional
+            }
+        # Snake activation (custom) - check for alpha parameter and in_features
+        elif hasattr(module, 'alpha') and isinstance(getattr(module, 'alpha', None), torch.nn.Parameter):
+            # Snake: alpha is a learnable parameter, extract in_features from its shape
+            alpha = module.alpha
+            if alpha.dim() >= 2:
+                cfg = {"in_features": alpha.shape[1]}
+            elif alpha.dim() == 1:
+                cfg = {"in_features": alpha.shape[0]}
         
         # GPT2 from HuggingFace transformers
         if hasattr(module, 'config') and hasattr(module.config, 'n_embd'):

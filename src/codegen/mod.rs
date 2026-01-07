@@ -2,7 +2,38 @@
 pub mod gpt2;
 
 use crate::LayerMeta;
+use serde::Serialize;
 use std::collections::HashMap;
+
+// ============================================================================
+// JSON Output Structs for Analysis
+// ============================================================================
+
+#[derive(Serialize, Debug)]
+pub struct AnalysisResult {
+    pub supported: usize,
+    pub unsupported: usize,
+    pub total: usize,
+    pub coverage_percent: f32,
+    pub gaps: Vec<GapInfo>,
+    pub layers: Vec<LayerInfo>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct GapInfo {
+    pub module_type: String,
+    pub count: usize,
+    pub suggestion: String,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct LayerInfo {
+    pub name: String,
+    pub module_type: String,
+    pub supported: bool,
+    pub input_shapes: Vec<Vec<usize>>,
+    pub output_shapes: Vec<Vec<usize>>,
+}
 
 pub struct Codegen {
     manifest: HashMap<String, LayerMeta>,
@@ -11,6 +42,102 @@ pub struct Codegen {
 impl Codegen {
     pub fn new(manifest: HashMap<String, LayerMeta>) -> Self {
         Self { manifest }
+    }
+
+    /// Analyze the manifest and return a structured result for JSON output
+    pub fn analyze(&self) -> AnalysisResult {
+        let mut supported = 0;
+        let mut unsupported = 0;
+        let mut gap_counts: HashMap<String, usize> = HashMap::new();
+        let mut layers = Vec::new();
+
+        for (name, meta) in &self.manifest {
+            if !meta.is_leaf {
+                continue;
+            }
+
+            let is_supported = self.is_supported(&meta.module_type);
+            if is_supported {
+                supported += 1;
+            } else {
+                unsupported += 1;
+                *gap_counts.entry(meta.module_type.clone()).or_default() += 1;
+            }
+
+            layers.push(LayerInfo {
+                name: name.clone(),
+                module_type: meta.module_type.clone(),
+                supported: is_supported,
+                input_shapes: meta.input_shapes.clone(),
+                output_shapes: meta.output_shapes.clone(),
+            });
+        }
+
+        // Sort layers by name for consistent output
+        layers.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let gaps: Vec<GapInfo> = gap_counts
+            .into_iter()
+            .map(|(t, c)| GapInfo {
+                suggestion: self.get_suggestion(&t),
+                module_type: t,
+                count: c,
+            })
+            .collect();
+
+        let total = supported + unsupported;
+        let coverage_percent = if total > 0 {
+            (supported as f32 / total as f32) * 100.0
+        } else {
+            100.0
+        };
+
+        AnalysisResult {
+            supported,
+            unsupported,
+            total,
+            coverage_percent,
+            gaps,
+            layers,
+        }
+    }
+
+    /// Check if a module type is supported by the codegen
+    pub fn is_supported(&self, module_type: &str) -> bool {
+        // Check GPT2 helper first
+        if gpt2::map_type(module_type).is_some() {
+            return true;
+        }
+
+        matches!(
+            module_type,
+            "Linear"
+                | "Conv1d"
+                | "LayerNorm"
+                | "Embedding"
+                | "ReLU"
+                | "GELU"
+                | "Sigmoid"
+                | "Tanh"
+                | "ELU"
+                | "LeakyReLU"
+                | "Snake"
+                | "BatchNorm1d"
+                | "BatchNorm2d"
+                | "LSTM"
+        )
+    }
+
+    /// Get implementation suggestion for an unsupported module type
+    pub fn get_suggestion(&self, module_type: &str) -> String {
+        match module_type {
+            "LSTM" => "Use /add-lstm workflow".to_string(),
+            "BatchNorm1d" | "BatchNorm2d" => "Use /add-batchnorm workflow".to_string(),
+            "Snake" | "ELU" => "Use /add-activations workflow".to_string(),
+            "Dropout" => "Dropout is a no-op at inference time".to_string(),
+            "Conv1D" => "HuggingFace Conv1D - implement as Linear with transpose".to_string(),
+            _ => format!("Implement {} manually", module_type),
+        }
     }
 
     pub fn generate_model_rs(&self, model_name: &str) -> String {
@@ -72,6 +199,17 @@ impl Codegen {
             "Conv1d" => "Conv1d".to_string(),
             "LayerNorm" => "LayerNorm".to_string(),
             "Embedding" => "Embedding".to_string(),
+            // Activations
+            "ReLU" => "ReLU".to_string(),
+            "GELU" => "GELU".to_string(),
+            "Sigmoid" => "Sigmoid".to_string(),
+            "Tanh" => "Tanh".to_string(),
+            "ELU" => "ELU".to_string(),
+            "LeakyReLU" => "LeakyReLU".to_string(),
+            "Snake" => "Snake".to_string(),
+            "BatchNorm1d" => "BatchNorm1d".to_string(),
+            "BatchNorm2d" => "BatchNorm2d".to_string(),
+            "LSTM" => "LSTM".to_string(),
             _ => format!("() /* TODO: {} */", py_type),
         }
     }
@@ -181,6 +319,79 @@ impl Codegen {
                 format!(
                     "candle_nn::embedding({}, {}, vb.pp(\"{}\"))?",
                     n, d, layer_name
+                )
+            }
+            // Activations - stateless
+            "ReLU" => "ReLU".to_string(),
+            "GELU" => "GELU".to_string(),
+            "Sigmoid" => "Sigmoid".to_string(),
+            "Tanh" => "Tanh".to_string(),
+            // Activations - parameterized
+            "ELU" => {
+                let alpha = meta
+                    .config
+                    .get("alpha")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0);
+                format!("ELU::new({})", alpha)
+            }
+            "LeakyReLU" => {
+                let slope = meta
+                    .config
+                    .get("negative_slope")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.01);
+                format!("LeakyReLU::new({})", slope)
+            }
+            "Snake" => {
+                let in_features = meta
+                    .config
+                    .get("in_features")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                format!("Snake::load(vb.pp(\"{}\"), {})?", layer_name, in_features)
+            }
+            "BatchNorm1d" => {
+                let num_features = meta
+                    .config
+                    .get("num_features")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                format!(
+                    "BatchNorm1d::load(vb.pp(\"{}\"), {})?",
+                    layer_name, num_features
+                )
+            }
+            "BatchNorm2d" => {
+                let num_features = meta
+                    .config
+                    .get("num_features")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                format!(
+                    "BatchNorm2d::load(vb.pp(\"{}\"), {})?",
+                    layer_name, num_features
+                )
+            }
+            "LSTM" => {
+                let input_size = meta
+                    .config
+                    .get("input_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let hidden_size = meta
+                    .config
+                    .get("hidden_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let num_layers = meta
+                    .config
+                    .get("num_layers")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1) as usize;
+                format!(
+                    "LSTM::load(vb.pp(\"{}\"), {}, {}, {})?",
+                    layer_name, input_size, hidden_size, num_layers
                 )
             }
             _ => format!(

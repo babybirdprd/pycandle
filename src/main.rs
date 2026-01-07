@@ -1,4 +1,5 @@
 mod codegen;
+mod todos;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -12,6 +13,10 @@ use std::process::Command;
 #[command(name = "pycandle")]
 #[command(about = "A tool for bit-perfect parity checking between PyTorch and Candle", long_about = None)]
 struct Cli {
+    /// Output in JSON format for agent consumption
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -45,6 +50,20 @@ enum Commands {
         /// Name of the model struct to generate
         #[arg(long, default_value = "MyModel")]
         model: String,
+
+        /// Analyze without generating code
+        #[arg(long)]
+        analyze_only: bool,
+    },
+    /// Extract and manage TODO markers in generated code
+    Todos {
+        /// Path to generated Rust file
+        #[arg(short, long)]
+        file: PathBuf,
+
+        /// Just check if TODOs remain (exit code 1 if any)
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -81,12 +100,8 @@ fn main() -> Result<()> {
             manifest: manifest_path,
             out,
             model,
+            analyze_only,
         } => {
-            println!(
-                "🏗️ Generating Candle code from manifest '{:?}'...",
-                manifest_path
-            );
-
             let manifest_content = std::fs::read_to_string(&manifest_path)
                 .with_context(|| format!("Failed to read manifest at {:?}", manifest_path))?;
 
@@ -94,12 +109,91 @@ fn main() -> Result<()> {
                 serde_json::from_str(&manifest_content).context("Failed to parse manifest JSON")?;
 
             let generator = Codegen::new(manifest);
-            let code = generator.generate_model_rs(&model);
 
-            std::fs::write(&out, code)
-                .with_context(|| format!("Failed to write generated code to {:?}", out))?;
+            if analyze_only || cli.json {
+                let analysis = generator.analyze();
 
-            println!("✅ Code generated successfully at {:?}", out);
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&analysis)
+                            .context("Failed to serialize analysis")?
+                    );
+                } else {
+                    println!("📊 Analysis of {:?}:", manifest_path);
+                    println!(
+                        "  Supported: {}/{} ({:.1}%)",
+                        analysis.supported, analysis.total, analysis.coverage_percent
+                    );
+                    println!("  Unsupported: {}", analysis.unsupported);
+                    if !analysis.gaps.is_empty() {
+                        println!("\n  Gaps:");
+                        for gap in &analysis.gaps {
+                            println!(
+                                "    - {}: {} occurrence(s) → {}",
+                                gap.module_type, gap.count, gap.suggestion
+                            );
+                        }
+                    }
+                }
+
+                if !analyze_only {
+                    // JSON mode but not analyze_only - still generate code
+                    let code = generator.generate_model_rs(&model);
+                    std::fs::write(&out, code)
+                        .with_context(|| format!("Failed to write generated code to {:?}", out))?;
+                }
+            } else {
+                println!(
+                    "🏗️ Generating Candle code from manifest '{:?}'...",
+                    manifest_path
+                );
+
+                let code = generator.generate_model_rs(&model);
+
+                std::fs::write(&out, code)
+                    .with_context(|| format!("Failed to write generated code to {:?}", out))?;
+
+                println!("✅ Code generated successfully at {:?}", out);
+            }
+        }
+        Commands::Todos { file, check } => {
+            let content = std::fs::read_to_string(&file)
+                .with_context(|| format!("Failed to read file at {:?}", file))?;
+
+            let todos = todos::extract_todos(&content);
+            let report = todos::generate_report(file.to_str().unwrap_or("unknown"), todos);
+
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).context("Failed to serialize report")?
+                );
+            } else {
+                println!("📋 TODOs in {:?}:", file);
+                println!("   Total: {}", report.total);
+                if !report.by_type.is_empty() {
+                    println!("\n   By type:");
+                    let mut types: Vec<_> = report.by_type.iter().collect();
+                    types.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+                    for (t, c) in types {
+                        println!("   - {}: {}", t, c);
+                    }
+                }
+                if !report.todos.is_empty() {
+                    println!("\n   Details:");
+                    for todo in &report.todos {
+                        println!(
+                            "   L{}: {} ({}) → {}",
+                            todo.line, todo.field_name, todo.module_type, todo.suggestion
+                        );
+                    }
+                }
+            }
+
+            if check && report.total > 0 {
+                std::process::exit(1);
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-use candle_core::{Device, Error, Result, Shape, Tensor};
+use candle_core::{Device, Error, IndexOp, Result, Shape, Tensor};
 use colored::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -161,4 +161,283 @@ macro_rules! py_check {
             c.verify($name, $tensor).expect("Parity Check Failed");
         }
     };
+}
+
+// ============================================================================
+// Activation Functions
+// ============================================================================
+
+/// ReLU activation: max(0, x)
+pub struct ReLU;
+impl ReLU {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        x.relu()
+    }
+}
+
+/// GELU activation (Gaussian Error Linear Unit)
+pub struct GELU;
+impl GELU {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        x.gelu_erf()
+    }
+}
+
+/// Sigmoid activation: 1 / (1 + exp(-x))
+pub struct Sigmoid;
+impl Sigmoid {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        candle_nn::ops::sigmoid(x)
+    }
+}
+
+/// Tanh activation
+pub struct Tanh;
+impl Tanh {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        x.tanh()
+    }
+}
+
+/// ELU activation: x if x > 0, else alpha * (exp(x) - 1)
+pub struct ELU {
+    pub alpha: f64,
+}
+impl ELU {
+    pub fn new(alpha: f64) -> Self {
+        Self { alpha }
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        x.elu(self.alpha)
+    }
+}
+
+/// LeakyReLU activation: x if x > 0, else negative_slope * x
+pub struct LeakyReLU {
+    pub negative_slope: f64,
+}
+impl LeakyReLU {
+    pub fn new(negative_slope: f64) -> Self {
+        Self { negative_slope }
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // leaky_relu: max(0, x) + negative_slope * min(0, x)
+        let zeros = x.zeros_like()?;
+        let pos = x.maximum(&zeros)?;
+        let neg = x.minimum(&zeros)?;
+        pos + (neg * self.negative_slope)?
+    }
+}
+
+/// Snake activation: x + sin²(αx)/α
+/// Used in neural vocoders like BigVGAN
+pub struct Snake {
+    pub alpha: Tensor,
+}
+impl Snake {
+    pub fn load(vb: candle_nn::VarBuilder, in_features: usize) -> Result<Self> {
+        let alpha = vb.get((1, in_features, 1), "alpha")?;
+        Ok(Self { alpha })
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // x: (B, C, T), alpha: (1, C, 1)
+        let ax = x.broadcast_mul(&self.alpha)?;
+        let sin_ax = ax.sin()?;
+        let sin_sq = sin_ax.sqr()?;
+        x + sin_sq.broadcast_div(&self.alpha)?
+    }
+}
+
+// ============================================================================
+// Normalization Layers
+// ============================================================================
+
+/// BatchNorm1d for inference (uses running statistics)
+/// Input: (B, C, T) or (B, C)
+pub struct BatchNorm1d {
+    pub weight: Tensor, // gamma
+    pub bias: Tensor,   // beta
+    pub running_mean: Tensor,
+    pub running_var: Tensor,
+    pub eps: f64,
+}
+
+impl BatchNorm1d {
+    pub fn load(vb: candle_nn::VarBuilder, num_features: usize) -> Result<Self> {
+        let weight = vb.get((num_features,), "weight")?;
+        let bias = vb.get((num_features,), "bias")?;
+        let running_mean = vb.get((num_features,), "running_mean")?;
+        let running_var = vb.get((num_features,), "running_var")?;
+        Ok(Self {
+            weight,
+            bias,
+            running_mean,
+            running_var,
+            eps: 1e-5,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // x: (B, C, T) for 1d or (B, C)
+        // Normalize: (x - mean) / sqrt(var + eps) * weight + bias
+        let ndim = x.dims().len();
+        let (mean, var, weight, bias) = if ndim == 3 {
+            // (B, C, T) - unsqueeze to (1, C, 1)
+            (
+                self.running_mean.unsqueeze(0)?.unsqueeze(2)?,
+                self.running_var.unsqueeze(0)?.unsqueeze(2)?,
+                self.weight.unsqueeze(0)?.unsqueeze(2)?,
+                self.bias.unsqueeze(0)?.unsqueeze(2)?,
+            )
+        } else {
+            // (B, C) - unsqueeze to (1, C)
+            (
+                self.running_mean.unsqueeze(0)?,
+                self.running_var.unsqueeze(0)?,
+                self.weight.unsqueeze(0)?,
+                self.bias.unsqueeze(0)?,
+            )
+        };
+
+        let normalized = x
+            .broadcast_sub(&mean)?
+            .broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        normalized.broadcast_mul(&weight)?.broadcast_add(&bias)
+    }
+}
+
+/// BatchNorm2d for inference (uses running statistics)
+/// Input: (B, C, H, W)
+pub struct BatchNorm2d {
+    pub weight: Tensor,
+    pub bias: Tensor,
+    pub running_mean: Tensor,
+    pub running_var: Tensor,
+    pub eps: f64,
+}
+
+impl BatchNorm2d {
+    pub fn load(vb: candle_nn::VarBuilder, num_features: usize) -> Result<Self> {
+        let weight = vb.get((num_features,), "weight")?;
+        let bias = vb.get((num_features,), "bias")?;
+        let running_mean = vb.get((num_features,), "running_mean")?;
+        let running_var = vb.get((num_features,), "running_var")?;
+        Ok(Self {
+            weight,
+            bias,
+            running_mean,
+            running_var,
+            eps: 1e-5,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // x: (B, C, H, W)
+        // Reshape stats to (1, C, 1, 1) for broadcasting
+        let mean = self.running_mean.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?;
+        let var = self.running_var.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?;
+        let weight = self.weight.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?;
+        let bias = self.bias.unsqueeze(0)?.unsqueeze(2)?.unsqueeze(3)?;
+
+        let normalized = x
+            .broadcast_sub(&mean)?
+            .broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        normalized.broadcast_mul(&weight)?.broadcast_add(&bias)
+    }
+}
+
+// ============================================================================
+// Recurrent Layers
+// ============================================================================
+
+/// LSTM layer (multi-layer, unidirectional)
+/// Input: (B, T, input_size) if batch_first=true
+/// Output: (output, (h_n, c_n))
+pub struct LSTM {
+    pub weight_ih: Vec<Tensor>, // One per layer: (4*hidden, input_size or hidden_size)
+    pub weight_hh: Vec<Tensor>, // One per layer: (4*hidden, hidden_size)
+    pub bias_ih: Vec<Tensor>,   // One per layer: (4*hidden,)
+    pub bias_hh: Vec<Tensor>,   // One per layer: (4*hidden,)
+    pub num_layers: usize,
+    pub hidden_size: usize,
+}
+
+impl LSTM {
+    pub fn load(
+        vb: candle_nn::VarBuilder,
+        input_size: usize,
+        hidden_size: usize,
+        num_layers: usize,
+    ) -> Result<Self> {
+        let mut weight_ih = Vec::new();
+        let mut weight_hh = Vec::new();
+        let mut bias_ih = Vec::new();
+        let mut bias_hh = Vec::new();
+
+        for layer in 0..num_layers {
+            let in_size = if layer == 0 { input_size } else { hidden_size };
+            weight_ih.push(vb.get((4 * hidden_size, in_size), &format!("weight_ih_l{}", layer))?);
+            weight_hh.push(vb.get(
+                (4 * hidden_size, hidden_size),
+                &format!("weight_hh_l{}", layer),
+            )?);
+            bias_ih.push(vb.get((4 * hidden_size,), &format!("bias_ih_l{}", layer))?);
+            bias_hh.push(vb.get((4 * hidden_size,), &format!("bias_hh_l{}", layer))?);
+        }
+
+        Ok(Self {
+            weight_ih,
+            weight_hh,
+            bias_ih,
+            bias_hh,
+            num_layers,
+            hidden_size,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<(Tensor, (Tensor, Tensor))> {
+        // x: (B, T, input_size) assuming batch_first
+        let (batch, seq_len, _) = x.dims3()?;
+        let device = x.device();
+        let dtype = x.dtype();
+
+        let h = Tensor::zeros((self.num_layers, batch, self.hidden_size), dtype, device)?;
+        let c = Tensor::zeros((self.num_layers, batch, self.hidden_size), dtype, device)?;
+        let mut output = x.clone();
+
+        for layer in 0..self.num_layers {
+            let mut h_t = h.i(layer)?;
+            let mut c_t = c.i(layer)?;
+            let mut outputs = Vec::new();
+
+            for t in 0..seq_len {
+                let x_t = output.i((.., t, ..))?;
+
+                // gates = x @ W_ih.T + h @ W_hh.T + b_ih + b_hh
+                let gates = x_t
+                    .matmul(&self.weight_ih[layer].t()?)?
+                    .broadcast_add(&h_t.matmul(&self.weight_hh[layer].t()?)?)?
+                    .broadcast_add(&self.bias_ih[layer])?
+                    .broadcast_add(&self.bias_hh[layer])?;
+
+                // Split into i, f, g, o (each of size hidden_size)
+                let chunks = gates.chunk(4, 1)?;
+                let i_gate = candle_nn::ops::sigmoid(&chunks[0])?;
+                let f_gate = candle_nn::ops::sigmoid(&chunks[1])?;
+                let g_gate = chunks[2].tanh()?;
+                let o_gate = candle_nn::ops::sigmoid(&chunks[3])?;
+
+                c_t = f_gate
+                    .broadcast_mul(&c_t)?
+                    .broadcast_add(&i_gate.broadcast_mul(&g_gate)?)?;
+                h_t = o_gate.broadcast_mul(&c_t.tanh()?)?;
+
+                outputs.push(h_t.unsqueeze(1)?);
+            }
+
+            output = Tensor::cat(&outputs, 1)?;
+        }
+
+        Ok((output, (h, c)))
+    }
 }
