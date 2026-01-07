@@ -165,7 +165,7 @@ TODOS=$(pycandle todos --file model.rs --json)
 for type in $(echo $TODOS | jq -r '.by_type | keys[]'); do
     echo "Implementing $type..."
     # Agent implements the type in lib.rs
-    # Then updates codegen.rs to use it
+    # Then updates src/codegen/mod.rs to use it
 done
 
 # 4. Re-generate and verify no TODOs remain

@@ -8,12 +8,12 @@ BatchNorm is frequently used in CNNs and speaker encoders (CAMPPlus uses ~100 Ba
 
 ## Steps
 
-### 1. Update `codegen.rs` to handle BatchNorm
+### 1. Update `src/codegen/mod.rs` to handle BatchNorm
 
 Add BatchNorm to the `map_type` function:
 
 ```rust
-// In src/codegen.rs, add to map_type():
+// In src/codegen/mod.rs, add to map_type():
 "BatchNorm1d" => "BatchNorm1d".to_string(),
 "BatchNorm2d" => "BatchNorm2d".to_string(),
 ```
@@ -52,7 +52,7 @@ impl BatchNorm1d {
 }
 ```
 
-### 3. Update `generate_init` in codegen.rs
+### 3. Update `generate_init` in src/codegen/mod.rs
 
 ```rust
 "BatchNorm1d" => {

@@ -87,7 +87,7 @@ impl LSTM {
 }
 ```
 
-### 2. Update codegen.rs map_type
+### 2. Update src/codegen/mod.rs map_type
 
 ```rust
 "LSTM" => "LSTM".to_string(),

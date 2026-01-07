@@ -39,7 +39,7 @@ def _get_module_config(self, m: nn.Module) -> Dict[str, Any]:
     return config
 ```
 
-### 2. Add GPT2 module mappings to codegen.rs
+### 2. Add GPT2 module mappings to src/codegen/gpt2.rs
 
 ```rust
 fn map_type(&self, py_type: &str) -> String {

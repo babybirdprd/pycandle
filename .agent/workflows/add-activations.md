@@ -8,7 +8,7 @@ Currently, custom activations like Snake, ELU, and Swish generate `todo!()` mark
 
 ## Steps
 
-### 1. Add activation mappings in codegen.rs
+### 1. Add activation mappings in src/codegen/mod.rs
 
 Update `map_type` to handle common activations:
 
