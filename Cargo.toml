@@ -1,17 +1,30 @@
-[package]
-name = "pycandle"
+[workspace]
+members = ["crates/pycandle", "crates/pycandle-core", "crates/pycandle-audio"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+# Candle ML framework
 candle-core = "0.8.2"
 candle-nn = "0.8.2"
+
+# Serialization
 safetensors = "0.5.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-thiserror = "1.0"
-colored = "2.0"
+
+# CLI & utilities
 clap = { version = "4.4", features = ["derive"] }
-walkdir = "2.4"
+colored = "2.0"
+thiserror = "1.0"
 anyhow = "1.0"
+walkdir = "2.4"
 regex = "1.10"
+
+# Internal crates
+pycandle-core = { path = "crates/pycandle-core" }
+pycandle-audio = { path = "crates/pycandle-audio" }

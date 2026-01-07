@@ -1,11 +1,14 @@
-mod codegen;
+//! PyCandle CLI
+//!
+//! Command-line interface for PyTorch → Candle porting.
+
 mod report;
 mod todos;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use codegen::Codegen;
-use pycandle::LayerMeta;
+use pycandle_core::LayerMeta;
+use pycandle_core::codegen::Codegen;
 use report::ReportGenerator;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -88,10 +91,6 @@ fn main() -> Result<()> {
                 "🚀 Recording trace for project '{}' using script '{:?}'...",
                 name, script
             );
-
-            // In a real scenario, we'd want to inject the GoldenRecorder into the user's script
-            // or provide a standard way for them to use it.
-            // For now, we assume their script already uses spy.py.
 
             let status = Command::new("uv")
                 .arg("run")

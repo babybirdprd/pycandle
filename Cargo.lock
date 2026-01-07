@@ -868,16 +868,35 @@ name = "pycandle"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "candle-core",
- "candle-nn",
  "clap",
  "colored",
+ "pycandle-core",
  "regex",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
+name = "pycandle-audio"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "thiserror",
+]
+
+[[package]]
+name = "pycandle-core"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "colored",
  "safetensors 0.5.3",
  "serde",
  "serde_json",
  "thiserror",
- "walkdir",
 ]
 
 [[package]]

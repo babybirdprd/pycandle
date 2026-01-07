@@ -1,5 +1,6 @@
-// GPT2 code generation helpers
-// This module provides codegen utilities for HuggingFace GPT2 models
+//! GPT2 code generation helpers
+//!
+//! This module provides codegen utilities for HuggingFace GPT2 models.
 
 use crate::LayerMeta;
 

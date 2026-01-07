@@ -30,7 +30,13 @@ class GoldenRecorder:
     def _get_module_config(self, module: nn.Module) -> Dict[str, Any]:
         cfg = {}
         if isinstance(module, nn.Linear):
-            cfg = {"in_features": module.in_features, "out_features": module.out_features, "bias": module.bias is not None}
+            cfg = {
+                "in_features": module.in_features,
+                "out_features": module.out_features,
+                "bias": module.bias is not None,
+                # Record actual weight shape for transpose detection
+                "weight_shape": list(module.weight.shape),  # [out, in] in PyTorch
+            }
         elif isinstance(module, nn.Conv1d):
             cfg = {
                 "in_channels": module.in_channels,

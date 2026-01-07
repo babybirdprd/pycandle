@@ -1,2 +1,10 @@
 /target
+Cargo.lock
 chatterbox-repo/*/
+*.safetensors
+*.pyc
+__pycache__/
+.venv/
+pycandle_trace/
+py_trace/
+*.html

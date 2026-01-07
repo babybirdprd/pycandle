@@ -1,4 +1,7 @@
-// Codegen module with helpers for different model types
+//! Code generation from PyTorch manifests to Candle Rust code
+//!
+//! This module generates idiomatic Rust code from recorded PyTorch model manifests.
+
 pub mod gpt2;
 
 use crate::LayerMeta;
@@ -35,6 +38,7 @@ pub struct LayerInfo {
     pub output_shapes: Vec<Vec<usize>>,
 }
 
+/// Code generator that converts manifests to Rust code
 pub struct Codegen {
     manifest: HashMap<String, LayerMeta>,
 }
@@ -146,11 +150,11 @@ impl Codegen {
         code.push_str(
             "use candle_nn::{Linear, Conv1d, LayerNorm, Embedding, VarBuilder, Module};\n",
         );
-        code.push_str("use crate::{PyChecker, py_check};\n");
+        code.push_str("use pycandle_core::{PyChecker, py_check};\n");
 
         // Add gpt2 import if GPT2 types are present
         if self.has_gpt2_types() {
-            code.push_str("use crate::gpt2;\n");
+            code.push_str("use pycandle_core::gpt2;\n");
         }
         code.push_str("\n");
 
@@ -280,7 +284,33 @@ impl Codegen {
                 let in_f = meta.config["in_features"].as_u64().unwrap_or(0);
                 let out_f = meta.config["out_features"].as_u64().unwrap_or(0);
                 let bias = meta.config["bias"].as_bool().unwrap_or(true);
-                if bias {
+
+                // Check for weight shape to detect transpose needs
+                let needs_transpose = meta
+                    .config
+                    .get("weight_shape")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        let dims: Vec<u64> = arr.iter().filter_map(|x| x.as_u64()).collect();
+                        // PyTorch Linear stores (out, in), if we see (in, out) we need transpose
+                        dims.len() == 2 && dims[0] == in_f && dims[1] == out_f
+                    })
+                    .unwrap_or(false);
+
+                if needs_transpose {
+                    format!(
+                        "{{ let w = vb.pp(\"{}\").get(({}, {}), \"weight\")?.t()?; \
+                         let b = {}; Linear::new(w, b) }}",
+                        layer_name,
+                        in_f,
+                        out_f,
+                        if bias {
+                            format!("Some(vb.pp(\"{}\").get({}, \"bias\")?)", layer_name, out_f)
+                        } else {
+                            "None".to_string()
+                        }
+                    )
+                } else if bias {
                     format!(
                         "candle_nn::linear({}, {}, vb.pp(\"{}\"))?",
                         in_f, out_f, layer_name

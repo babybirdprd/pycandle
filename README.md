@@ -32,7 +32,7 @@ recorder.save("my_model")
 ### 2. Generate Candle code
 
 ```bash
-cargo run -- codegen \
+cargo run -p pycandle -- codegen \
     --manifest traces/my_model_manifest.json \
     --out generated_my_model.rs \
     --model MyModel
@@ -41,7 +41,7 @@ cargo run -- codegen \
 ### 3. Use generated code with parity checking
 
 ```rust
-use pycandle::{PyChecker, py_check};
+use pycandle_core::{PyChecker, py_check};
 
 // Load golden records for verification
 let checker = PyChecker::load("my_model", "traces/", &device)?;
@@ -123,7 +123,7 @@ recorder.save("project_name")  # Saves .safetensors + _manifest.json
 ## Rust Verification API
 
 ```rust
-use pycandle::{PyChecker, py_check};
+use pycandle_core::{PyChecker, py_check};
 
 // Load checker
 let checker = PyChecker::load("model_name", "traces/", &device)?;
@@ -167,30 +167,115 @@ impl MyModel {
 
 | PyTorch | Candle | Status |
 |---------|--------|--------|
-| `nn.Linear` | `candle_nn::linear` | ✅ Auto |
+| `nn.Linear` | `candle_nn::linear` | ✅ Auto (with smart transpose) |
 | `nn.Conv1d` | `candle_nn::conv1d` | ✅ Auto |
 | `nn.Embedding` | `candle_nn::embedding` | ✅ Auto |
 | `nn.LayerNorm` | `candle_nn::layer_norm` | ✅ Auto |
 | `nn.BatchNorm1d` | `BatchNorm1d` | ✅ Auto |
 | `nn.BatchNorm2d` | `BatchNorm2d` | ✅ Auto |
 | `nn.LSTM` | `LSTM` | ✅ Auto |
+| `nn.ReLU/GELU/Sigmoid/Tanh` | Activations | ✅ Auto |
+| `nn.ELU/LeakyReLU` | Parameterized activations | ✅ Auto |
+| `Snake` (BigVGAN) | `Snake` | ✅ Auto |
 | Custom modules | - | ⚠️ TODO marker |
 
-## Project Structure
+## Workspace Structure
 
 ```
 pycandle/
-├── src/
-│   ├── main.rs          # CLI entry point
-│   ├── lib.rs           # PyChecker, py_check! macro, layer implementations
-│   ├── todos.rs         # TODO extraction from generated code
-│   └── codegen/
-│       ├── mod.rs       # Manifest → Rust code generator
-│       └── gpt2.rs      # GPT2-specific helpers
-├── py/
-│   └── spy.py           # GoldenRecorder
-└── Cargo.toml
+├── Cargo.toml              # Workspace root
+├── crates/
+│   ├── pycandle/           # CLI binary
+│   │   └── src/main.rs
+│   ├── pycandle-core/      # Library (PyChecker, layers, codegen)
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── checker.rs
+│   │       ├── layers.rs
+│   │       └── codegen/
+│   └── pycandle-audio/     # Audio ops (STFT, padding)
+│       └── src/lib.rs
+└── py/
+    └── spy.py              # GoldenRecorder
 ```
+
+**Using as a library:**
+```toml
+[dependencies]
+pycandle-core = { git = "https://github.com/user/pycandle" }
+# Optional audio support:
+pycandle-audio = { git = "https://github.com/user/pycandle" }
+```
+
+---
+
+## Roadmap
+
+These features are planned for future development:
+
+### 🔄 DAG Resolver (torch.fx Tracing)
+**Status:** Planned
+
+Handle non-sequential models with skip connections and branches:
+- Use `torch.fx` to trace computation graphs
+- Generate named variables instead of sequential `x = layer(x)`
+- Automatic residual detection: `let out = (x_2 + xs)?;`
+- Support for tensor concatenation and branching
+
+```rust
+// Future generated code:
+let x_1 = self.conv1.forward(xs)?;
+let x_2 = self.bn1.forward(&x_1)?;
+let out = (x_2 + xs)?; // Residual detected automatically
+```
+
+### 📊 Visual Drift Analysis (Heatmap)
+**Status:** Planned
+
+Enhanced diagnostics for numerical drift:
+- D3.js heatmap showing MSE across layers
+- "Point of Divergence" detector (highlights where cosine similarity < 0.99)
+- Accumulated error graph (MSE vs Layer Depth)
+- ASCII terminal fallback for CI environments
+
+### 🔬 Interactive Debugger (Lock-Step)
+**Status:** Planned
+
+When parity checks fail:
+- Save erroneous tensors to `.safetensors` snippet
+- Generate Python comparison script for side-by-side inspection
+- Jupyter notebook template for interactive debugging
+
+### 🎵 Audio-Specific Ops (pycandle-audio)
+**Status:** Partial (padding implemented, STFT blocked on Candle FFT)
+
+PyTorch-parity audio operations:
+- ✅ Reflect/Replicate/Constant padding (`pad_1d`)
+- ✅ Hann window generation
+- ⏳ STFT (requires Candle FFT support)
+- ⏳ iSTFT (requires Candle FFT support)
+
+### 📐 Symbolic Shape Propagation
+**Status:** Planned
+
+Generate Config structs instead of hardcoded dimensions:
+```rust
+pub struct Config {
+    pub n_mels: usize,    // 80
+    pub hidden_dim: usize, // 512
+    pub vocab_size: usize, // 50257
+}
+```
+
+### ⚡ Minimal Developer Code
+**Status:** Planned
+
+One-command project setup:
+- `pycandle init` - detect project structure, generate recording script
+- Auto-detect model entry points from `pyproject.toml`
+- Generate ready-to-run verification binary
+
+---
 
 ## License
 

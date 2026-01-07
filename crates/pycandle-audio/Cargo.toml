@@ -1,0 +1,11 @@
+[package]
+name = "pycandle-audio"
+description = "Audio ops for PyCandle: STFT, iSTFT, and padding with PyTorch parity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+thiserror.workspace = true

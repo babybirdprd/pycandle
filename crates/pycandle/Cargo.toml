@@ -1,0 +1,20 @@
+[package]
+name = "pycandle"
+description = "CLI for PyTorch → Candle porting with layer-wise parity verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pycandle"
+path = "src/main.rs"
+
+[dependencies]
+pycandle-core.workspace = true
+clap.workspace = true
+colored.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true
+regex.workspace = true

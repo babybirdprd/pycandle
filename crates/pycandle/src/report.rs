@@ -1,5 +1,5 @@
 // Report generation for PyCandle coverage analysis
-use crate::LayerMeta;
+use pycandle_core::LayerMeta;
 use std::collections::HashMap;
 
 /// Data structure holding analysis results
@@ -341,6 +341,76 @@ impl ReportGenerator {
             border-color: var(--blue);
         }}
         .hidden {{ display: none !important; }}
+        
+        /* Drift Analysis Chart Styles */
+        .drift-section {{
+            background: var(--card-bg);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            padding: 24px;
+            margin-bottom: 32px;
+        }}
+        .drift-section h2 {{
+            margin-top: 0;
+            margin-bottom: 16px;
+        }}
+        .drift-chart {{
+            width: 100%;
+            height: 300px;
+            position: relative;
+        }}
+        .drift-chart svg {{
+            width: 100%;
+            height: 100%;
+        }}
+        .drift-legend {{
+            display: flex;
+            gap: 24px;
+            margin-top: 16px;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+        }}
+        .drift-legend-item {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .drift-legend-color {{
+            width: 16px;
+            height: 16px;
+            border-radius: 4px;
+        }}
+        .divergence-alert {{
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid var(--red);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }}
+        .divergence-alert .icon {{
+            font-size: 1.5rem;
+        }}
+        .divergence-alert .message {{
+            flex: 1;
+        }}
+        .divergence-alert .layer-name {{
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--red);
+            font-weight: 600;
+        }}
+        .drift-placeholder {{
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+        }}
+        .drift-placeholder .icon {{
+            font-size: 3rem;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }}
     </style>
 </head>
 <body>
@@ -365,6 +435,154 @@ impl ReportGenerator {
                 <div class="value">{unsupported}</div>
             </div>
         </div>
+        
+        <!-- Drift Analysis Section -->
+        <div class="drift-section">
+            <h2>📊 Numerical Drift Analysis</h2>
+            <div id="divergenceAlert" class="divergence-alert" style="display: none;">
+                <span class="icon">⚠️</span>
+                <div class="message">
+                    <strong>Divergence Detected!</strong> Cosine similarity dropped below 0.99 at layer 
+                    <span class="layer-name" id="divergenceLayer">-</span>
+                </div>
+            </div>
+            <div class="drift-chart" id="driftChart">
+                <div class="drift-placeholder">
+                    <div class="icon">📈</div>
+                    <p>Run parity verification to see drift analysis</p>
+                    <p style="font-size: 0.8rem; margin-top: 8px;">
+                        Use <code>PyChecker::verify()</code> and pass results to generate this chart
+                    </p>
+                </div>
+            </div>
+            <div class="drift-legend">
+                <div class="drift-legend-item">
+                    <div class="drift-legend-color" style="background: #3b82f6;"></div>
+                    <span>MSE (log scale)</span>
+                </div>
+                <div class="drift-legend-item">
+                    <div class="drift-legend-color" style="background: #22c55e;"></div>
+                    <span>Cosine Similarity</span>
+                </div>
+                <div class="drift-legend-item">
+                    <div class="drift-legend-color" style="background: #ef4444;"></div>
+                    <span>Divergence Threshold (0.99)</span>
+                </div>
+            </div>
+        </div>
+        
+        <script src="https://d3js.org/d3.v7.min.js"></script>
+        <script>
+            // Drift data will be injected here when parity checks are run
+            const driftData = {drift_data_json};
+            
+            if (driftData && driftData.length > 0) {{
+                renderDriftChart(driftData);
+            }}
+            
+            function renderDriftChart(data) {{
+                const container = document.getElementById('driftChart');
+                container.innerHTML = '';
+                
+                const margin = {{top: 20, right: 60, bottom: 60, left: 60}};
+                const width = container.clientWidth - margin.left - margin.right;
+                const height = 260 - margin.top - margin.bottom;
+                
+                const svg = d3.select('#driftChart')
+                    .append('svg')
+                    .attr('width', width + margin.left + margin.right)
+                    .attr('height', height + margin.top + margin.bottom)
+                    .append('g')
+                    .attr('transform', `translate(${{margin.left}},${{margin.top}})`);
+                
+                // Scales
+                const x = d3.scaleBand()
+                    .domain(data.map((d, i) => i))
+                    .range([0, width])
+                    .padding(0.1);
+                
+                const yMSE = d3.scaleLog()
+                    .domain([1e-10, d3.max(data, d => d.mse) * 10])
+                    .range([height, 0]);
+                
+                const yCosSim = d3.scaleLinear()
+                    .domain([0.9, 1])
+                    .range([height, 0]);
+                
+                // MSE bars
+                svg.selectAll('.bar-mse')
+                    .data(data)
+                    .enter()
+                    .append('rect')
+                    .attr('class', 'bar-mse')
+                    .attr('x', (d, i) => x(i))
+                    .attr('y', d => yMSE(Math.max(d.mse, 1e-10)))
+                    .attr('width', x.bandwidth())
+                    .attr('height', d => height - yMSE(Math.max(d.mse, 1e-10)))
+                    .attr('fill', '#3b82f6')
+                    .attr('opacity', 0.7);
+                
+                // Cosine similarity line
+                const line = d3.line()
+                    .x((d, i) => x(i) + x.bandwidth() / 2)
+                    .y(d => yCosSim(d.cosine_sim))
+                    .curve(d3.curveMonotoneX);
+                
+                svg.append('path')
+                    .datum(data)
+                    .attr('fill', 'none')
+                    .attr('stroke', '#22c55e')
+                    .attr('stroke-width', 2)
+                    .attr('d', line);
+                
+                // Threshold line at 0.99
+                svg.append('line')
+                    .attr('x1', 0)
+                    .attr('x2', width)
+                    .attr('y1', yCosSim(0.99))
+                    .attr('y2', yCosSim(0.99))
+                    .attr('stroke', '#ef4444')
+                    .attr('stroke-width', 1)
+                    .attr('stroke-dasharray', '4,4');
+                
+                // Find divergence point
+                const divergencePoint = data.findIndex(d => d.cosine_sim < 0.99);
+                if (divergencePoint >= 0) {{
+                    document.getElementById('divergenceAlert').style.display = 'flex';
+                    document.getElementById('divergenceLayer').textContent = data[divergencePoint].name;
+                    
+                    // Highlight divergence point
+                    svg.append('circle')
+                        .attr('cx', x(divergencePoint) + x.bandwidth() / 2)
+                        .attr('cy', yCosSim(data[divergencePoint].cosine_sim))
+                        .attr('r', 6)
+                        .attr('fill', '#ef4444')
+                        .attr('stroke', '#fff')
+                        .attr('stroke-width', 2);
+                }}
+                
+                // Axes
+                svg.append('g')
+                    .attr('transform', `translate(0,${{height}})`)
+                    .call(d3.axisBottom(x).tickFormat(i => data[i]?.name?.split('.').pop() || i))
+                    .selectAll('text')
+                    .attr('transform', 'rotate(-45)')
+                    .style('text-anchor', 'end')
+                    .style('fill', '#94a3b8')
+                    .style('font-size', '10px');
+                
+                svg.append('g')
+                    .call(d3.axisLeft(yMSE).ticks(5, '.0e'))
+                    .selectAll('text')
+                    .style('fill', '#3b82f6');
+                
+                svg.append('g')
+                    .attr('transform', `translate(${{width}},0)`)
+                    .call(d3.axisRight(yCosSim).ticks(5))
+                    .selectAll('text')
+                    .style('fill', '#22c55e');
+            }}
+        </script>
         
         <h2>Gap Analysis</h2>
         <table>
@@ -404,6 +622,8 @@ impl ReportGenerator {
             },
             gaps_table = self.render_gaps_table(&data.gaps),
             components_html = self.render_components(&data.layers),
+            // Drift data - empty for now, will be populated by parity checks
+            drift_data_json = "[]",
         )
     }
 
