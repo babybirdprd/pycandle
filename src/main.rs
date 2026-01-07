@@ -1,10 +1,12 @@
 mod codegen;
+mod report;
 mod todos;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use codegen::Codegen;
 use pycandle::LayerMeta;
+use report::ReportGenerator;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
@@ -64,6 +66,16 @@ enum Commands {
         /// Just check if TODOs remain (exit code 1 if any)
         #[arg(long)]
         check: bool,
+    },
+    /// Generate an HTML coverage report
+    Report {
+        /// Path to the manifest JSON file
+        #[arg(short, long)]
+        manifest: PathBuf,
+
+        /// Output HTML file path
+        #[arg(short, long, default_value = "pycandle_report.html")]
+        out: PathBuf,
     },
 }
 
@@ -194,6 +206,22 @@ fn main() -> Result<()> {
             if check && report.total > 0 {
                 std::process::exit(1);
             }
+        }
+        Commands::Report { manifest, out } => {
+            let manifest_content = std::fs::read_to_string(&manifest)
+                .with_context(|| format!("Failed to read manifest at {:?}", manifest))?;
+
+            let manifest_data: HashMap<String, LayerMeta> =
+                serde_json::from_str(&manifest_content).context("Failed to parse manifest JSON")?;
+
+            let generator = ReportGenerator::new(manifest_data);
+            let data = generator.analyze();
+            let html = generator.generate_html(&data);
+
+            std::fs::write(&out, html)
+                .with_context(|| format!("Failed to write report to {:?}", out))?;
+
+            println!("📊 Report generated: {:?}", out);
         }
     }
 
