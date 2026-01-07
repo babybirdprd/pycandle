@@ -2,7 +2,7 @@
 
 **Automated PyTorch → Candle porting with layer-wise parity verification.**
 
-PyCandle records activation traces from PyTorch models and generates Rust Candle code with embedded verification hooks.
+PyCandle captures activation traces from PyTorch models to generate verified Rust Candle code. Acting as "Chrome DevTools" for neural networks, it provides full transparency into the internal state of complex models, ensuring seamless parity across Python and Rust.
 
 ## Quick Start
 
