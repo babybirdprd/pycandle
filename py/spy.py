@@ -222,7 +222,7 @@ class GoldenRecorder:
         }
         return self._fx_graph
 
-    def save(self, project_name: str, use_fx: bool = False):
+    def save(self, project_name: str, use_fx: bool = False, hints: Optional[Dict[str, int]] = None):
         tensor_path = os.path.join(self.output_dir, f"{project_name}_trace.safetensors")
         # Filter out None values (meta placeholders)
         real_records = {k: v for k, v in self.records.items() if v is not None}
@@ -237,6 +237,9 @@ class GoldenRecorder:
         if use_fx and hasattr(self, '_fx_graph'):
             manifest_data["_graph_nodes"] = self._fx_graph["graph_nodes"]
             manifest_data["_graph_code"] = self._fx_graph["graph_code"]
+
+        if hints:
+            manifest_data["_symbolic_hints"] = hints
 
         with open(manifest_path, "w") as f:
             json.dump(manifest_data, f, indent=4)

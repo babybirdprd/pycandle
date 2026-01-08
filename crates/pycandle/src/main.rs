@@ -214,6 +214,8 @@ fn main() -> Result<()> {
                     graph_nodes: Option<Vec<pycandle_core::codegen::GraphNode>>,
                     #[serde(rename = "_graph_code")]
                     graph_code: Option<String>,
+                    #[serde(rename = "_symbolic_hints")]
+                    symbolic_hints: Option<HashMap<String, usize>>,
                 }
 
                 let full_manifest: Manifest = serde_json::from_str(&manifest_content)
@@ -231,7 +233,7 @@ fn main() -> Result<()> {
                     })
                     .collect::<Result<_>>()?;
 
-                let mut generator = Codegen::new(layers);
+                let mut generator = Codegen::new(layers, full_manifest.symbolic_hints);
                 if let Some(nodes) = full_manifest.graph_nodes {
                     generator = generator.with_graph(nodes);
                 }

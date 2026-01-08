@@ -265,7 +265,7 @@ Tools to handle the "Integration Gap" between PyTorch checkpoints and Rust struc
 - **Meta-Extractor:** CLI tool to surgically extract only the weights used in a manifest, significantly reducing checkpoint size.
 
 ### 🧪 Automated Test Generation
-**Status:** Planned
+**Status:** Complete ✅
 
 Eliminate manual test writing by generating the full Rust test harness:
 - **Auto-Test CLI:** `pycandle gen-test` to generate `tests/parity.rs` automatically.

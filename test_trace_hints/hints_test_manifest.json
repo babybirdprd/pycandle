@@ -1,0 +1,63 @@
+{
+    "embedding": {
+        "name": "embedding",
+        "module_type": "Embedding",
+        "input_shapes": [
+            [
+                1,
+                10
+            ]
+        ],
+        "output_shapes": [
+            [
+                1,
+                10,
+                64
+            ]
+        ],
+        "parameters": [
+            "weight"
+        ],
+        "is_leaf": true,
+        "config": {
+            "num_embeddings": 64,
+            "embedding_dim": 64
+        }
+    },
+    "linear": {
+        "name": "linear",
+        "module_type": "Linear",
+        "input_shapes": [
+            [
+                1,
+                10,
+                64
+            ]
+        ],
+        "output_shapes": [
+            [
+                1,
+                10,
+                64
+            ]
+        ],
+        "parameters": [
+            "weight",
+            "bias"
+        ],
+        "is_leaf": true,
+        "config": {
+            "in_features": 64,
+            "out_features": 64,
+            "bias": true,
+            "weight_shape": [
+                64,
+                64
+            ]
+        }
+    },
+    "_symbolic_hints": {
+        "vocab_size": 64,
+        "hidden_dim": 64
+    }
+}

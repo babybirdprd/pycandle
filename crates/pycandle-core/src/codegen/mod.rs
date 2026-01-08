@@ -68,14 +68,19 @@ pub struct Codegen {
     manifest: HashMap<String, LayerMeta>,
     graph_nodes: Option<Vec<GraphNode>>,
     config: SymbolicConfig,
+    hints: HashMap<String, usize>,
 }
 
 impl Codegen {
-    pub fn new(manifest: HashMap<String, LayerMeta>) -> Self {
+    pub fn new(
+        manifest: HashMap<String, LayerMeta>,
+        hints: Option<HashMap<String, usize>>,
+    ) -> Self {
         let mut slf = Self {
             manifest,
             graph_nodes: None,
             config: SymbolicConfig::default(),
+            hints: hints.unwrap_or_default(),
         };
         slf.config = slf.extract_symbolic_config();
         slf
@@ -87,7 +92,7 @@ impl Codegen {
     }
 
     pub fn extract_symbolic_config(&self) -> SymbolicConfig {
-        let mut dims = HashMap::new();
+        let mut dims = self.hints.clone();
 
         for meta in self.manifest.values() {
             // GPT2 specific extraction
