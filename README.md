@@ -214,19 +214,31 @@ pycandle-audio = { git = "https://github.com/user/pycandle" }
 These features are planned for future development:
 
 ### 🔄 DAG Resolver (torch.fx Tracing)
-**Status:** Planned
+**Status:** Complete ✅
 
 Handle non-sequential models with skip connections and branches:
-- Use `torch.fx` to trace computation graphs
-- Generate named variables instead of sequential `x = layer(x)`
-- Automatic residual detection: `let out = (x_2 + xs)?;`
-- Support for tensor concatenation and branching
+- Use `torch.fx` to trace computation graphs automatically via `recorder.record(model, x, trace_fx=True)`
+- Generate named variables based on FX graph nodes instead of sequential `x = layer(x)`
+- Automatic residual detection: `let out = (&x_bn2 + &xs)?;`
+- Support for tensor concatenation, branching, and common tensor methods (`view`, `reshape`, `flatten`, etc.)
+
+**Usage Example:**
+
+```python
+# python (spy.py)
+recorder = GoldenRecorder()
+recorder.record(model, x, trace_fx=True) # Captures the FX graph
+recorder.save("my_model", use_fx=True)   # Embeds graph in manifest
+```
 
 ```rust
-// Future generated code:
-let x_1 = self.conv1.forward(xs)?;
-let x_2 = self.bn1.forward(&x_1)?;
-let out = (x_2 + xs)?; // Residual detected automatically
+// Generated Rust forward method
+pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    let x_conv1 = self.conv1.forward(&xs)?;
+    let x_bn1 = self.bn1.forward(&x_conv1)?;
+    let x_add = (&x_bn1 + &xs)?; // Residual detected automagically
+    Ok(x_add)
+}
 ```
 
 ### 📊 Visual Drift Analysis (Heatmap)

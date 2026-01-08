@@ -158,7 +158,7 @@ class GoldenRecorder:
             )
         return hook
 
-    def record(self, model: nn.Module, *args, **kwargs):
+    def record(self, model: nn.Module, *args, trace_fx: bool = False, **kwargs):
         model.eval()
         hooks = []
         for name, module in model.named_modules():
@@ -172,6 +172,9 @@ class GoldenRecorder:
             for h in hooks:
                 h.remove()
         
+        if trace_fx:
+            self.trace_fx(model, *args, **kwargs)
+            
         return output
 
     def trace_fx(self, model: nn.Module, *example_inputs):

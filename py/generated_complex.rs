@@ -28,7 +28,9 @@ impl ComplexModel {
         py_check!(self.checker, "conv1", &x_conv1);
         let x_relu = self.relu.forward(&x_conv1)?;
         py_check!(self.checker, "relu", &x_relu);
-        let x_fc = self.fc.forward(&view)?;
+        let x_size = x_relu.dim(0)?;
+        let x_view = x_relu.reshape(vec![x_size, -1])?;
+        let x_fc = self.fc.forward(&x_view)?;
         py_check!(self.checker, "fc", &x_fc);
         Ok(x_fc)
     }
