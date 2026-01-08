@@ -1,0 +1,78 @@
+{
+    "layer1": {
+        "name": "layer1",
+        "module_type": "Linear",
+        "input_shapes": [
+            [
+                1,
+                10
+            ]
+        ],
+        "output_shapes": [
+            [
+                1,
+                20
+            ]
+        ],
+        "parameters": [],
+        "is_leaf": true,
+        "config": {}
+    },
+    "layer2": {
+        "name": "layer2",
+        "module_type": "ReLU",
+        "input_shapes": [
+            [
+                1,
+                20
+            ]
+        ],
+        "output_shapes": [
+            [
+                1,
+                20
+            ]
+        ],
+        "parameters": [],
+        "is_leaf": true,
+        "config": {}
+    },
+    "layer3": {
+        "name": "layer3",
+        "module_type": "Linear",
+        "input_shapes": [
+            [
+                1,
+                20
+            ]
+        ],
+        "output_shapes": [
+            [
+                1,
+                30
+            ]
+        ],
+        "parameters": [],
+        "is_leaf": true,
+        "config": {}
+    },
+    "layer4": {
+        "name": "layer4",
+        "module_type": "Sigmoid",
+        "input_shapes": [
+            [
+                1,
+                30
+            ]
+        ],
+        "output_shapes": [
+            [
+                1,
+                30
+            ]
+        ],
+        "parameters": [],
+        "is_leaf": true,
+        "config": {}
+    }
+}

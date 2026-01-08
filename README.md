@@ -240,7 +240,7 @@ pub struct Config {
 ```
 
 ### 📊 Visual Drift Analysis (Mechanistic Diagnostics)
-**Status:** In Progress 🛠️
+**Status:** Complete ✅
 
 Enhanced diagnostics for numerical drift using real verification data:
 - **Live Data Ingestion:** Update `PyChecker` to export `verification_results.json` which populates the D3.js report.
@@ -272,7 +272,7 @@ Tools to handle the "Integration Gap" between PyTorch checkpoints and Rust struc
 - **Meta-Extractor:** CLI tool to read a multi-gigabyte PyTorch file and extract *only* the tensors defined in the `manifest.json`, renaming them on the fly for Candle.
 
 ### 🔬 Interactive Debugger (Lock-Step)
-**Status:** Planned
+**Status:** Complete ✅
 
 When a `py_check!` fails in Rust:
 - Save a `.safetensors` snippet containing the erroneous Rust tensor and the Golden reference.

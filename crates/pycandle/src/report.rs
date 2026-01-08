@@ -622,9 +622,28 @@ impl ReportGenerator {
             },
             gaps_table = self.render_gaps_table(&data.gaps),
             components_html = self.render_components(&data.layers),
-            // Drift data - empty for now, will be populated by parity checks
-            drift_data_json = "[]",
+            // Drift data - read from jsonl if exists
+            drift_data_json = self.read_drift_data(),
         )
+    }
+
+    fn read_drift_data(&self) -> String {
+        let path = std::path::Path::new("verification_results.jsonl");
+        if !path.exists() {
+            return "[]".to_string();
+        }
+
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let lines: Vec<String> = content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.to_string())
+                .collect();
+
+            format!("[{}]", lines.join(","))
+        } else {
+            "[]".to_string()
+        }
     }
 
     fn render_gaps_table(&self, gaps: &HashMap<String, usize>) -> String {

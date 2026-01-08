@@ -4,6 +4,8 @@ use candle_core::{Device, Error, Result, Shape, Tensor};
 use colored::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 
 /// Metadata for a recorded layer
@@ -19,11 +21,14 @@ pub struct LayerMeta {
 }
 
 /// Result of comparing two tensors
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ComparisonResult {
+    pub name: String,
     pub mse: f32,
     pub max_diff: f32,
     pub cosine_sim: f32,
     pub passed: bool,
+    pub heatmap: Option<Vec<f32>>,
 }
 
 /// PyChecker loads golden tensors and verifies Rust outputs against them
@@ -81,10 +86,15 @@ impl PyChecker {
             )));
         }
 
-        let result = self.compare_tensors(actual, expected)?;
+        let mut result = self.compare_tensors(actual, expected)?;
+        result.name = layer_name.to_string();
 
         if result.mse > self.atol {
+            // Compute heatmap for dashboard
+            result.heatmap = self.compute_heatmap(actual, expected);
+
             self.report_failure(layer_name, &result, actual, expected);
+            self.log_result(&result);
             return Err(Error::Msg(format!(
                 "Numerical parity failed for {}",
                 layer_name
@@ -98,7 +108,20 @@ impl PyChecker {
             result.mse,
             result.cosine_sim
         );
+        self.log_result(&result);
         Ok(result)
+    }
+
+    fn log_result(&self, result: &ComparisonResult) {
+        if let Ok(json) = serde_json::to_string(result) {
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("verification_results.jsonl")
+            {
+                let _ = writeln!(file, "{}", json);
+            }
+        }
     }
 
     fn compare_tensors(&self, a: &Tensor, b: &Tensor) -> Result<ComparisonResult> {
@@ -114,10 +137,12 @@ impl PyChecker {
         let cosine_sim = dot / (norm_a * norm_b + 1e-8);
 
         Ok(ComparisonResult {
+            name: "unknown".to_string(), // Will be overwritten by caller
             mse,
             max_diff,
             cosine_sim,
             passed: mse <= self.atol,
+            heatmap: None,
         })
     }
 
@@ -154,9 +179,119 @@ impl PyChecker {
         println!("  MSE:      {:.8}", res.mse);
         println!("  Cos Sim:  {:.8}", res.cosine_sim);
 
-        let a_mean = actual.mean_all().unwrap().to_scalar::<f32>().unwrap();
-        let e_mean = expected.mean_all().unwrap().to_scalar::<f32>().unwrap();
+        let a_mean = actual.mean_all().unwrap().to_scalar::<f32>().unwrap_or(0.0);
+        let e_mean = expected
+            .mean_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap_or(0.0);
         println!("  Means:    Rust={:.6}, Py={:.6}", a_mean, e_mean);
+
+        // --- Active Debugging Artifacts ---
+        let failures_dir = Path::new("failures");
+        if !failures_dir.exists() {
+            let _ = std::fs::create_dir(failures_dir);
+        }
+
+        // 1. Save Tensor Snippet (.safetensors)
+        let snippet_path = failures_dir.join(format!("{}.safetensors", name));
+        let tensors_to_save = HashMap::from([
+            ("rust_actual".to_string(), actual.clone()),
+            ("py_golden".to_string(), expected.clone()),
+        ]);
+        if let Err(e) = candle_core::safetensors::save(&tensors_to_save, &snippet_path) {
+            println!("  Failed to save snippet: {}", e);
+        } else {
+            println!(
+                "  💾 Snippet saved: {}",
+                snippet_path.display().to_string().cyan()
+            );
+        }
+
+        // 2. Generate Python Analysis Script
+        let script_path = failures_dir.join(format!("debug_{}.py", name));
+        let script_content = format!(
+            r#"
+import torch
+from safetensors.torch import load_file
+import matplotlib.pyplot as plt
+import numpy as np
+
+def analyze():
+    print(f"🔍 Analyzing Failure: {{'{name}'}}")
+    tensors = load_file("{filename}")
+    rust = tensors["rust_actual"]
+    gold = tensors["py_golden"]
+
+    diff = (rust - gold).abs()
+    print(f"  Max Diff: {{diff.max().item():.6f}}")
+    print(f"  MSE:      {{(diff ** 2).mean().item():.8f}}")
+
+    # Plot
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.title("Rust Tensor Histogram")
+    plt.hist(rust.flatten().float().numpy(), bins=50, alpha=0.7, label='Rust')
+    plt.hist(gold.flatten().float().numpy(), bins=50, alpha=0.7, label='Gold')
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.title("Difference Heatmap (First Slice)")
+    if diff.ndim > 1:
+        plt.imshow(diff.flatten(0, -2)[0].float().numpy(), cmap='hot', aspect='auto')
+    else:
+        plt.plot(diff.float().numpy())
+    
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    analyze()
+"#,
+            name = name,
+            filename = format!("{}.safetensors", name)
+        );
+
+        if let Ok(mut file) = std::fs::File::create(&script_path) {
+            let _ = file.write_all(script_content.as_bytes());
+            println!(
+                "  🐍 Script generated: {}",
+                script_path.display().to_string().cyan()
+            );
+        }
+
         println!("{}\n", "---------------------------".red());
+    }
+
+    pub fn compute_heatmap(&self, a: &Tensor, b: &Tensor) -> Option<Vec<f32>> {
+        // Compute absolute difference
+        let diff = (a - b).ok()?.abs().ok()?;
+
+        // 1. Flatten to 1D
+        let flat = diff.flatten_all().ok()?;
+        let numel = flat.elem_count();
+
+        // 2. We want an 8x8 grid = 64 buckets
+        let grid_size = 64;
+        if numel < grid_size {
+            return None; // Too small to pool usefuly
+        }
+
+        let chunk_size = numel / grid_size;
+
+        // 3. Simple max pooling into buckets
+        // Walking through the tensor on CPU is slow for huge tensors, but this is a failure case anyway.
+        // A faster way is to reshape (64, chunk_size) and max(dim=1).
+
+        let reshaped = flat
+            .narrow(0, 0, grid_size * chunk_size)
+            .ok()?
+            .reshape((grid_size, chunk_size))
+            .ok()?;
+
+        let pooled = reshaped.max(1).ok()?;
+
+        // Convert to Vec<f32>
+        pooled.to_vec1::<f32>().ok()
     }
 }

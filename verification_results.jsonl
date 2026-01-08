@@ -1,0 +1,4 @@
+{"name":"layer1.out.0", "mse":1e-10, "max_diff":1e-5, "cosine_sim":1.0, "passed":true}
+{"name":"layer2.out.0", "mse":1e-8, "max_diff":1e-4, "cosine_sim":0.9999, "passed":true}
+{"name":"layer3.out.0", "mse":0.05, "max_diff":0.1, "cosine_sim":0.95, "passed":false}
+{"name":"layer4.out.0", "mse":0.2, "max_diff":0.5, "cosine_sim":0.8, "passed":false}

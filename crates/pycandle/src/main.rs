@@ -2,6 +2,7 @@
 //!
 //! Command-line interface for PyTorch → Candle porting.
 
+mod dashboard;
 mod report;
 mod todos;
 
@@ -80,10 +81,15 @@ enum Commands {
         #[arg(short, long, default_value = "pycandle_report.html")]
         out: PathBuf,
     },
-    /// Manage and surgically extract model weights
     Weights {
         #[command(subcommand)]
         action: WeightActions,
+    },
+    /// Launch the TUI Parity Dashboard
+    Dashboard {
+        // Optional arguments if we want to pass filter to cargo test
+        #[arg(last = true)]
+        args: Vec<String>,
     },
 }
 
@@ -394,6 +400,9 @@ fn main() -> Result<()> {
                 println!("✅ Renaming complete: {:?}", out);
             }
         },
+        Commands::Dashboard { args } => {
+            dashboard::run_dashboard(&args)?;
+        }
     }
 
     Ok(())
