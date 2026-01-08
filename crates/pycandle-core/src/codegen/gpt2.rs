@@ -84,13 +84,39 @@ pub fn extract_config(meta: &LayerMeta) -> GptConfig {
 }
 
 /// Generate initialization code for GPT2 layer types
-pub fn generate_init(layer_name: &str, meta: &LayerMeta) -> Option<String> {
+pub fn generate_init(
+    layer_name: &str,
+    meta: &LayerMeta,
+    symbolic_dims: &std::collections::HashMap<String, usize>,
+) -> Option<String> {
+    let render_dim = |val: usize, preferred: &str| -> String {
+        if !preferred.is_empty() {
+            if let Some(&v) = symbolic_dims.get(preferred) {
+                if v == val {
+                    return format!("cfg.{}", preferred);
+                }
+            }
+        }
+        for (name, &v) in symbolic_dims {
+            if v == val {
+                return format!("cfg.{}", name);
+            }
+        }
+        val.to_string()
+    };
+
     match meta.module_type.as_str() {
         "GPT2Model" | "GPT2LMHeadModel" => {
             let cfg = extract_config(meta);
+            let vocab_size = render_dim(cfg.vocab_size, "vocab_size");
+            let context_length = render_dim(cfg.context_length, "context_length");
+            let emb_dim = render_dim(cfg.emb_dim, "hidden_dim");
+            let n_heads = render_dim(cfg.n_heads, "n_head");
+            let n_layers = render_dim(cfg.n_layers, "n_layers");
+
             Some(format!(
                 r#"{{
-                let cfg = gpt2::Config {{
+                let gpt_cfg = gpt2::Config {{
                     vocab_size: {},
                     context_length: {},
                     emb_dim: {},
@@ -99,15 +125,9 @@ pub fn generate_init(layer_name: &str, meta: &LayerMeta) -> Option<String> {
                     drop_rate: {:.1},
                     qkv_bias: false,
                 }};
-                gpt2::GPTModel::new(cfg, &vb.pp("{}"))?
+                gpt2::GPTModel::new(gpt_cfg, &vb.pp("{}"))?
             }}"#,
-                cfg.vocab_size,
-                cfg.context_length,
-                cfg.emb_dim,
-                cfg.n_heads,
-                cfg.n_layers,
-                cfg.drop_rate,
-                layer_name
+                vocab_size, context_length, emb_dim, n_heads, n_layers, cfg.drop_rate, layer_name
             ))
         }
         "GPT2Block" => Some(format!(
@@ -115,16 +135,19 @@ pub fn generate_init(layer_name: &str, meta: &LayerMeta) -> Option<String> {
             layer_name
         )),
         "GPT2Attention" => {
-            let dim = meta
+            let dim_val = meta
                 .config
                 .get("n_embd")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(768);
-            let heads = meta
+                .unwrap_or(768) as usize;
+            let heads_val = meta
                 .config
                 .get("n_head")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(12);
+                .unwrap_or(12) as usize;
+            let dim = render_dim(dim_val, "hidden_dim");
+            let heads = render_dim(heads_val, "n_head");
+
             Some(format!(
                 "gpt2::MultiHeadAttention::new({}, {}, 0.1, {}, false, &vb.pp(\"{}\"))?",
                 dim, dim, heads, layer_name

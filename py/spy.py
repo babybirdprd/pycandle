@@ -119,8 +119,7 @@ class GoldenRecorder:
             shapes.append(list(data.shape))
         elif isinstance(data, (tuple, list)):
             for item in data:
-                if isinstance(item, torch.Tensor):
-                    shapes.append(list(item.shape))
+                shapes.extend(self._extract_shapes(item))
         return shapes
 
     def hook_factory(self, name: str):

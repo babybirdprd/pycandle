@@ -139,6 +139,11 @@ py_check!(checker, "layer_name", &tensor);
 ## Generated Code Structure
 
 ```rust
+pub struct Config {
+    pub vocab_size: usize,
+    pub hidden_dim: usize,
+}
+
 pub struct MyModel {
     pub linear1: Linear,
     pub linear2: Linear,
@@ -146,9 +151,9 @@ pub struct MyModel {
 }
 
 impl MyModel {
-    pub fn load(vb: VarBuilder, checker: Option<PyChecker>) -> Result<Self> {
-        let linear1 = candle_nn::linear(128, 256, vb.pp("linear1"))?;
-        let linear2 = candle_nn::linear(256, 10, vb.pp("linear2"))?;
+    pub fn load(cfg: Config, vb: VarBuilder, checker: Option<PyChecker>) -> Result<Self> {
+        let linear1 = candle_nn::linear(cfg.hidden_dim, 256, vb.pp("linear1"))?;
+        let linear2 = candle_nn::linear(256, cfg.vocab_size, vb.pp("linear2"))?;
         Ok(Self { linear1, linear2, checker })
     }
 
@@ -211,7 +216,7 @@ pycandle-audio = { git = "https://github.com/user/pycandle" }
 
 ## Roadmap
 
-These features are planned for future development:
+These features are planned or currently in development to move PyCandle from a utility to a production-grade transpilation framework:
 
 ### 🔄 DAG Resolver (torch.fx Tracing)
 **Status:** Complete ✅
@@ -222,71 +227,73 @@ Handle non-sequential models with skip connections and branches:
 - Automatic residual detection: `let out = (&x_bn2 + &xs)?;`
 - Support for tensor concatenation, branching, and common tensor methods (`view`, `reshape`, `flatten`, etc.)
 
-**Usage Example:**
+### 📐 Symbolic Shape Propagation
+**Status:** Complete ✅
 
-```python
-# python (spy.py)
-recorder = GoldenRecorder()
-recorder.record(model, x, trace_fx=True) # Captures the FX graph
-recorder.save("my_model", use_fx=True)   # Embeds graph in manifest
-```
-
+Generate Config structs instead of hardcoded dimensions. This decouples the model logic from specific input sizes:
 ```rust
-// Generated Rust forward method
-pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-    let x_conv1 = self.conv1.forward(&xs)?;
-    let x_bn1 = self.bn1.forward(&x_conv1)?;
-    let x_add = (&x_bn1 + &xs)?; // Residual detected automagically
-    Ok(x_add)
+pub struct Config {
+    pub context_length: usize, // 1024
+    pub hidden_dim: usize,     // 768
+    pub vocab_size: usize,     // 50257
 }
 ```
 
-### 📊 Visual Drift Analysis (Heatmap)
-**Status:** Planned
+### 📊 Visual Drift Analysis (Mechanistic Diagnostics)
+**Status:** In Progress 🛠️
 
-Enhanced diagnostics for numerical drift:
-- D3.js heatmap showing MSE across layers
-- "Point of Divergence" detector (highlights where cosine similarity < 0.99)
-- Accumulated error graph (MSE vs Layer Depth)
-- ASCII terminal fallback for CI environments
-
-### 🔬 Interactive Debugger (Lock-Step)
-**Status:** Planned
-
-When parity checks fail:
-- Save erroneous tensors to `.safetensors` snippet
-- Generate Python comparison script for side-by-side inspection
-- Jupyter notebook template for interactive debugging
+Enhanced diagnostics for numerical drift using real verification data:
+- **Live Data Ingestion:** Update `PyChecker` to export `verification_results.json` which populates the D3.js report.
+- **MSE Heatmap:** Visual representation of "Math Leakage" across layers.
+- **Point of Divergence:** Automatically highlight the exact layer where `Cosine Similarity` drops below `0.99`.
 
 ### 🎵 Audio-Specific Ops (pycandle-audio)
-**Status:** Ready
+**Status:** In Progress 🛠️
 
 PyTorch-parity audio operations:
 - ✅ Reflect/Replicate/Constant padding (`pad_1d`)
 - ✅ Hann window generation
-- ✅ STFT (CPU-based using `realfft`)
-- ✅ iSTFT (CPU-based using `realfft`)
+- ✅ STFT/iSTFT (CPU-based using `realfft`)
+- **Planned:** Bit-perfect `MelSpectrogram` implementation matching `torchaudio.transforms` (including Slaney-scale parity).
 
-### 📐 Symbolic Shape Propagation
+### 🛠️ Advanced FX Logic Mapping
+**Status:** Complete ✅
+
+Expanding the DAG resolver to handle complex Pythonic tensor manipulation:
+- **Slicing/Indexing:** Map PyTorch `x[:, :10]` (operator.getitem) to Candle `.narrow()` or `.i()`.
+- **Tuple/Multi-Output:** Support for modules that return multiple tensors (e.g., Attention weights or RNN hidden states).
+- **Chunk/Split:** Native mapping for `torch.chunk` and `torch.split` used in GLU activations.
+
+### 📦 Surgical Weight Management
 **Status:** Planned
 
-Generate Config structs instead of hardcoded dimensions:
-```rust
-pub struct Config {
-    pub n_mels: usize,    // 80
-    pub hidden_dim: usize, // 512
-    pub vocab_size: usize, // 50257
-}
-```
+Tools to handle the "Integration Gap" between PyTorch checkpoints and Rust structs:
+- **Checkpoint Mapper:** JSON-based renaming engine to map PyTorch keys (`encoder.block.0`) to Rust field names (`h.0`) without code changes.
+- **Meta-Extractor:** CLI tool to read a multi-gigabyte PyTorch file and extract *only* the tensors defined in the `manifest.json`, renaming them on the fly for Candle.
+
+### 🔬 Interactive Debugger (Lock-Step)
+**Status:** Planned
+
+When a `py_check!` fails in Rust:
+- Save a `.safetensors` snippet containing the erroneous Rust tensor and the Golden reference.
+- Generate a Python comparison script for side-by-side inspection in a Jupyter notebook.
+- ASCII terminal "Mini-Heatmap" for quick debugging in CI environments.
 
 ### ⚡ Minimal Developer Code
 **Status:** Planned
 
 One-command project setup:
-- `pycandle init` - detect project structure, generate recording script
-- Auto-detect model entry points from `pyproject.toml`
-- Generate ready-to-run verification binary
-- Abstract away uv direct usage in cli
+- `pycandle init` - Detect project structure and generate a boilerplate recording script.
+- Auto-detect model entry points from `pyproject.toml`.
+- Generate ready-to-run verification binaries automatically.
+
+---
+
+### Summary of the "Powerful" PyCandle Vision:
+1.  **Python Spy:** Captures Graph (FX) + Config + Activations + Weights.
+2.  **Transpiler:** Converts FX Graph to idiomatic Rust DAG (with residuals).
+3.  **Verifiable Crate:** Generated code with `py_check!` macros that "lights up" green as you implement layers.
+4.  **Diagnostics:** A visual report showing exactly where the "Math Leak" is happening.
 
 ---
 
