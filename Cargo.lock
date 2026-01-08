@@ -877,6 +877,7 @@ name = "pycandle"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "candle-core",
  "clap",
  "colored",
  "pycandle-core",
@@ -901,9 +902,11 @@ dependencies = [
 name = "pycandle-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "candle-core",
  "candle-nn",
  "colored",
+ "regex",
  "safetensors 0.5.3",
  "serde",
  "serde_json",

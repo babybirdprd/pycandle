@@ -80,6 +80,47 @@ enum Commands {
         #[arg(short, long, default_value = "pycandle_report.html")]
         out: PathBuf,
     },
+    /// Manage and surgically extract model weights
+    Weights {
+        #[command(subcommand)]
+        action: WeightActions,
+    },
+}
+
+#[derive(Subcommand)]
+enum WeightActions {
+    /// Surgically extract weights used in a manifest
+    Extract {
+        /// Path to PyTorch checkpoint (.bin, .pt, .safetensors)
+        #[arg(short, long)]
+        checkpoint: PathBuf,
+
+        /// Path to the manifest JSON file
+        #[arg(short, long)]
+        manifest: PathBuf,
+
+        /// Output .safetensors path
+        #[arg(short, long)]
+        out: PathBuf,
+
+        /// Optional JSON mapping file for renaming
+        #[arg(long)]
+        map: Option<PathBuf>,
+    },
+    /// Rename keys in a safetensors file using a mapping
+    Map {
+        /// Input .safetensors file
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output .safetensors file
+        #[arg(short, long)]
+        out: PathBuf,
+
+        /// JSON mapping file
+        #[arg(short, long)]
+        map: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -308,6 +349,51 @@ fn main() -> Result<()> {
 
             println!("📊 Report generated: {:?}", out);
         }
+        Commands::Weights { action } => match action {
+            WeightActions::Extract {
+                checkpoint,
+                manifest,
+                out,
+                map,
+            } => {
+                println!("🔪 Performing surgical weight extraction...");
+                let mut cmd = Command::new("uv");
+                cmd.arg("run")
+                    .arg("python")
+                    .arg("py/weight_extractor.py")
+                    .arg("--checkpoint")
+                    .arg(&checkpoint)
+                    .arg("--manifest")
+                    .arg(&manifest)
+                    .arg("--out")
+                    .arg(&out);
+
+                if let Some(m) = map {
+                    cmd.arg("--map").arg(m);
+                }
+
+                let status = cmd.spawn()?.wait()?;
+                if status.success() {
+                    println!("✅ Extraction complete: {:?}", out);
+                } else {
+                    anyhow::bail!("Weight extraction failed");
+                }
+            }
+            WeightActions::Map { input, out, map } => {
+                println!("🔄 Renaming weights using map {:?}...", map);
+                let map_content = std::fs::read_to_string(&map)?;
+                let mapper = pycandle_core::WeightMapper::from_json(&map_content)?;
+
+                let weights = candle_core::safetensors::load(&input, &candle_core::Device::Cpu)?;
+                let mut renamed_weights = HashMap::new();
+                for (name, tensor) in weights {
+                    renamed_weights.insert(mapper.map_key(&name), tensor);
+                }
+
+                candle_core::safetensors::save(&renamed_weights, &out)?;
+                println!("✅ Renaming complete: {:?}", out);
+            }
+        },
     }
 
     Ok(())

@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 pycandle-core.workspace = true
+candle-core.workspace = true
 clap.workspace = true
 colored.workspace = true
 anyhow.workspace = true

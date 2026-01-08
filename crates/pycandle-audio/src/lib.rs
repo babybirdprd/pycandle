@@ -16,6 +16,50 @@ pub enum PadMode {
     Constant(f64),
 }
 
+/// Mel scale types
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MelScale {
+    /// HTK scale: 2595 * log10(1 + f / 700)
+    Htk,
+    /// Slaney scale: linear below 1kHz, log above
+    Slaney,
+}
+
+/// Normalization modes for Mel banks
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MelNorm {
+    /// No normalization
+    None,
+    /// Slaney-style area normalization
+    Slaney,
+}
+
+/// MelSpectrogram configuration matching torchaudio.transforms.MelSpectrogram
+#[derive(Debug, Clone)]
+pub struct MelSpectrogramConfig {
+    pub stft_config: StftConfig,
+    pub sample_rate: usize,
+    pub n_mels: usize,
+    pub f_min: f64,
+    pub f_max: Option<f64>,
+    pub mel_scale: MelScale,
+    pub norm: MelNorm,
+}
+
+impl Default for MelSpectrogramConfig {
+    fn default() -> Self {
+        Self {
+            stft_config: StftConfig::default(),
+            sample_rate: 16000,
+            n_mels: 128,
+            f_min: 0.0,
+            f_max: None,
+            mel_scale: MelScale::Htk,
+            norm: MelNorm::None,
+        }
+    }
+}
+
 /// STFT configuration matching PyTorch's torch.stft
 #[derive(Debug, Clone)]
 pub struct StftConfig {
@@ -128,6 +172,146 @@ pub fn hann_window(length: usize, device: &candle_core::Device) -> Result<Tensor
         values[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / length as f32).cos());
     }
     Tensor::from_vec(values, (length,), device)
+}
+
+/// Convert Hz to Mel frequency
+pub fn hz_to_mel(freq: f64, scale: MelScale) -> f64 {
+    match scale {
+        MelScale::Htk => 2595.0 * (1.0 + freq / 700.0).log10(),
+        MelScale::Slaney => {
+            let min_log_hz = 1000.0;
+            let min_log_mel = 15.0;
+            let log_step = (6.4f64).ln() / 27.0;
+            if freq >= min_log_hz {
+                min_log_mel + (freq / min_log_hz).ln() / log_step
+            } else {
+                3.0 * freq / 200.0
+            }
+        }
+    }
+}
+
+/// Convert Mel frequency to Hz
+pub fn mel_to_hz(mel: f64, scale: MelScale) -> f64 {
+    match scale {
+        MelScale::Htk => 700.0 * (10f64.powf(mel / 2595.0) - 1.0),
+        MelScale::Slaney => {
+            let min_log_hz = 1000.0;
+            let min_log_mel = 15.0;
+            let log_step = (6.4f64).ln() / 27.0;
+            if mel >= min_log_mel {
+                min_log_hz * (log_step * (mel - min_log_mel)).exp()
+            } else {
+                200.0 * mel / 3.0
+            }
+        }
+    }
+}
+
+/// Create a Mel filterbank matrix of shape (n_mels, n_fft / 2 + 1)
+pub fn get_mel_banks(
+    n_mels: usize,
+    n_fft: usize,
+    sample_rate: usize,
+    f_min: f64,
+    f_max: f64,
+    scale: MelScale,
+    norm: MelNorm,
+) -> Result<Tensor> {
+    let n_bins = n_fft / 2 + 1;
+    let mel_min = hz_to_mel(f_min, scale);
+    let mel_max = hz_to_mel(f_max, scale);
+
+    let mut mel_points = vec![0.0f64; n_mels + 2];
+    for i in 0..n_mels + 2 {
+        mel_points[i] = mel_min + i as f64 * (mel_max - mel_min) / (n_mels + 1) as f64;
+    }
+
+    let mut hz_points = vec![0.0f64; n_mels + 2];
+    for i in 0..n_mels + 2 {
+        hz_points[i] = mel_to_hz(mel_points[i], scale);
+    }
+
+    let mut fft_freqs = vec![0.0f64; n_bins];
+    for i in 0..n_bins {
+        fft_freqs[i] = i as f64 * sample_rate as f64 / n_fft as f64;
+    }
+
+    let mut filterbank = vec![0.0f32; n_mels * n_bins];
+
+    for i in 0..n_mels {
+        let left = hz_points[i];
+        let center = hz_points[i + 1];
+        let right = hz_points[i + 2];
+
+        for j in 0..n_bins {
+            let f = fft_freqs[j];
+            if f > left && f < right {
+                let val = if f <= center {
+                    (f - left) / (center - left)
+                } else {
+                    (right - f) / (right - center)
+                };
+
+                // Area normalization (Slaney)
+                let val = if norm == MelNorm::Slaney {
+                    val * 2.0 / (right - left)
+                } else {
+                    val
+                };
+
+                filterbank[i * n_bins + j] = val as f32;
+            }
+        }
+    }
+
+    Tensor::from_vec(filterbank, (n_mels, n_bins), &candle_core::Device::Cpu)
+}
+
+/// MelSpectrogram transformation
+pub fn mel_spectrogram(
+    input: &Tensor,
+    config: &MelSpectrogramConfig,
+    window: Option<&Tensor>,
+) -> Result<Tensor> {
+    let n_fft = config.stft_config.n_fft;
+    let f_max = config.f_max.unwrap_or(config.sample_rate as f64 / 2.0);
+
+    // 1. STFT
+    let spec = stft(input, &config.stft_config, window)?;
+
+    // spec is (B, n_bins, n_frames, 2) or (n_bins, n_frames, 2)
+    // 2. Power Spectrogram (magnitude squared)
+    let power = spec
+        .narrow(spec.dims().len() - 1, 0, 1)?
+        .sqr()?
+        .add(&spec.narrow(spec.dims().len() - 1, 1, 1)?.sqr()?)?;
+    let power = power.squeeze(spec.dims().len() - 1)?;
+
+    // 3. Mel Filterbank
+    let mel_banks = get_mel_banks(
+        config.n_mels,
+        n_fft,
+        config.sample_rate,
+        config.f_min,
+        f_max,
+        config.mel_scale,
+        config.norm,
+    )?
+    .to_device(input.device())?
+    .to_dtype(input.dtype())?;
+
+    // Apply filterbank: (n_mels, n_bins) * (..., n_bins, n_frames)
+    // We need to reorder power to (..., n_frames, n_bins) to use matmul or just use a custom dot product
+    // Or just use matmul if we transpose.
+    // power is (B, n_bins, n_frames)
+    let power = power.transpose(power.dims().len() - 2, power.dims().len() - 1)?;
+    // power is (B, n_frames, n_bins)
+
+    let mel_spec = power.matmul(&mel_banks.transpose(0, 1)?)?;
+    // mel_spec is (B, n_frames, n_mels)
+
+    mel_spec.transpose(mel_spec.dims().len() - 2, mel_spec.dims().len() - 1)
 }
 
 /// Short-time Fourier Transform (STFT)
@@ -376,5 +560,45 @@ mod tests {
                 x_hat_vec[i]
             );
         }
+    }
+
+    #[test]
+    fn test_mel_scales() {
+        // HTK parity
+        let hz = 1000.0;
+        let mel = hz_to_mel(hz, MelScale::Htk);
+        assert!((mel - 1000.0).abs() < 0.1);
+        let hz_back = mel_to_hz(mel, MelScale::Htk);
+        assert!((hz_back - hz).abs() < 1e-5);
+
+        // Slaney parity
+        let hz_s = 2000.0;
+        let mel_s = hz_to_mel(hz_s, MelScale::Slaney);
+        // Slaney: 15 + log(2000/1000) / log_step
+        assert!((mel_s - 25.0).abs() < 0.1);
+        let hz_back_s = mel_to_hz(mel_s, MelScale::Slaney);
+        assert!((hz_back_s - hz_s).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_get_mel_banks() {
+        let n_mels = 40;
+        let n_fft = 1024;
+        let sample_rate = 16000;
+        let f_min = 0.0;
+        let f_max = 8000.0;
+
+        let banks = get_mel_banks(
+            n_mels,
+            n_fft,
+            sample_rate,
+            f_min,
+            f_max,
+            MelScale::Htk,
+            MelNorm::None,
+        )
+        .unwrap();
+
+        assert_eq!(banks.dims(), &[40, 513]);
     }
 }

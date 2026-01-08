@@ -13,10 +13,12 @@ pub mod codegen;
 pub mod gpt2;
 mod layers;
 pub mod samplers;
+pub mod weights;
 
 pub use checker::{ComparisonResult, LayerMeta, PyChecker};
 pub use layers::*;
 pub use samplers::*;
+pub use weights::{WeightExtractor, WeightMapper};
 
 /// Verify tensor against golden record, panics on mismatch
 #[macro_export]

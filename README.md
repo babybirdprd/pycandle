@@ -248,13 +248,13 @@ Enhanced diagnostics for numerical drift using real verification data:
 - **Point of Divergence:** Automatically highlight the exact layer where `Cosine Similarity` drops below `0.99`.
 
 ### 🎵 Audio-Specific Ops (pycandle-audio)
-**Status:** In Progress 🛠️
+**Status:** Complete ✅
 
 PyTorch-parity audio operations:
-- ✅ Reflect/Replicate/Constant padding (`pad_1d`)
-- ✅ Hann window generation
-- ✅ STFT/iSTFT (CPU-based using `realfft`)
-- **Planned:** Bit-perfect `MelSpectrogram` implementation matching `torchaudio.transforms` (including Slaney-scale parity).
+- [x] Reflect/Replicate/Constant padding (`pad_1d`)
+- [x] Hann window generation
+- [x] STFT/iSTFT (CPU-based using `realfft`)
+- [x] Bit-perfect `MelSpectrogram` implementation matching `torchaudio.transforms` (including Slaney-scale parity).
 
 ### 🛠️ Advanced FX Logic Mapping
 **Status:** Complete ✅
@@ -265,7 +265,7 @@ Expanding the DAG resolver to handle complex Pythonic tensor manipulation:
 - **Chunk/Split:** Native mapping for `torch.chunk` and `torch.split` used in GLU activations.
 
 ### 📦 Surgical Weight Management
-**Status:** Planned
+**Status:** Complete ✅
 
 Tools to handle the "Integration Gap" between PyTorch checkpoints and Rust structs:
 - **Checkpoint Mapper:** JSON-based renaming engine to map PyTorch keys (`encoder.block.0`) to Rust field names (`h.0`) without code changes.
