@@ -1,6 +1,6 @@
 /target
 Cargo.lock
-chatterbox-repo/*/
+# chatterbox-repo/*/
 *.safetensors
 *.pyc
 __pycache__/
@@ -8,3 +8,4 @@ __pycache__/
 pycandle_trace/
 py_trace/
 *.html
+py/__pycache__/*/

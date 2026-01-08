@@ -48,7 +48,7 @@ enum Commands {
         #[arg(short, long)]
         manifest: PathBuf,
 
-        /// Output path for the generated Rust file
+        /// Output path for the generated Rust file or directory
         #[arg(short, long)]
         out: PathBuf,
 
@@ -62,9 +62,9 @@ enum Commands {
     },
     /// Extract and manage TODO markers in generated code
     Todos {
-        /// Path to generated Rust file
+        /// Path to generated Rust file or directory
         #[arg(short, long)]
-        file: PathBuf,
+        path: PathBuf,
 
         /// Just check if TODOs remain (exit code 1 if any)
         #[arg(long)]
@@ -108,101 +108,187 @@ fn main() -> Result<()> {
             }
         }
         Commands::Codegen {
-            manifest: manifest_path,
-            out,
+            manifest: start_path,
+            out: out_path,
             model,
             analyze_only,
         } => {
-            let manifest_content = std::fs::read_to_string(&manifest_path)
-                .with_context(|| format!("Failed to read manifest at {:?}", manifest_path))?;
+            // Find manifests: if directory, glob *.json, else use file
+            let manifest_files = if start_path.is_dir() {
+                std::fs::read_dir(&start_path)?
+                    .filter_map(|entry| {
+                        let path = entry.ok()?.path();
+                        if path.extension()?.to_str()? == "json"
+                            && path.file_name()?.to_str()?.ends_with("_manifest.json")
+                        {
+                            Some(path)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![start_path]
+            };
 
-            let manifest: HashMap<String, LayerMeta> =
-                serde_json::from_str(&manifest_content).context("Failed to parse manifest JSON")?;
+            if manifest_files.is_empty() {
+                eprintln!("❌ No manifest files found.");
+                return Ok(());
+            }
 
-            let generator = Codegen::new(manifest);
+            for manifest_path in manifest_files {
+                let manifest_content = std::fs::read_to_string(&manifest_path)
+                    .with_context(|| format!("Failed to read manifest at {:?}", manifest_path))?;
 
-            if analyze_only || cli.json {
-                let analysis = generator.analyze();
+                // Full manifest structure including optional graph
+                #[derive(serde::Deserialize)]
+                struct Manifest {
+                    #[serde(flatten)]
+                    layers: HashMap<String, serde_json::Value>,
+                    #[serde(rename = "_graph_nodes")]
+                    graph_nodes: Option<Vec<pycandle_core::codegen::GraphNode>>,
+                    #[serde(rename = "_graph_code")]
+                    graph_code: Option<String>,
+                }
 
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&analysis)
-                            .context("Failed to serialize analysis")?
-                    );
-                } else {
-                    println!("📊 Analysis of {:?}:", manifest_path);
-                    println!(
-                        "  Supported: {}/{} ({:.1}%)",
-                        analysis.supported, analysis.total, analysis.coverage_percent
-                    );
-                    println!("  Unsupported: {}", analysis.unsupported);
-                    if !analysis.gaps.is_empty() {
-                        println!("\n  Gaps:");
-                        for gap in &analysis.gaps {
-                            println!(
-                                "    - {}: {} occurrence(s) → {}",
-                                gap.module_type, gap.count, gap.suggestion
-                            );
+                let full_manifest: Manifest = serde_json::from_str(&manifest_content)
+                    .context("Failed to parse manifest JSON")?;
+
+                // Filter out internal keys starting with "_"
+                let layers: HashMap<String, LayerMeta> = full_manifest
+                    .layers
+                    .into_iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .map(|(k, v)| {
+                        let meta: LayerMeta = serde_json::from_value(v)
+                            .with_context(|| format!("Failed to parse LayerMeta for {}", k))?;
+                        Ok((k, meta))
+                    })
+                    .collect::<Result<_>>()?;
+
+                let mut generator = Codegen::new(layers);
+                if let Some(nodes) = full_manifest.graph_nodes {
+                    generator = generator.with_graph(nodes);
+                }
+
+                if analyze_only || cli.json {
+                    let analysis = generator.analyze();
+
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&analysis)
+                                .context("Failed to serialize analysis")?
+                        );
+                    } else {
+                        println!("📊 Analysis of {:?}:", manifest_path);
+                        println!(
+                            "  Supported: {}/{} ({:.1}%)",
+                            analysis.supported, analysis.total, analysis.coverage_percent
+                        );
+                        println!("  Unsupported: {}", analysis.unsupported);
+                        if !analysis.gaps.is_empty() {
+                            println!("\n  Gaps:");
+                            for gap in &analysis.gaps {
+                                println!(
+                                    "    - {}: {} occurrence(s) → {}",
+                                    gap.module_type, gap.count, gap.suggestion
+                                );
+                            }
                         }
                     }
                 }
 
                 if !analyze_only {
-                    // JSON mode but not analyze_only - still generate code
+                    // Determine output path
+                    let final_out = if out_path.is_dir() {
+                        let stem = manifest_path.file_stem().unwrap().to_str().unwrap();
+                        let name = stem.replace("_manifest", "");
+                        out_path.join(format!("generated_{}.rs", name))
+                    } else {
+                        // If multiple manifests but one output file, this is ambiguous/wrong unless overwriting.
+                        // We'll enforce directory output if input is directory.
+                        out_path.clone()
+                    };
+
+                    println!(
+                        "🏗️ Generating Candle code from manifest '{:?}'...",
+                        manifest_path
+                    );
+
+                    // Use model name from CLI args for struct name.
+                    // TODO: maybe derive struct name from manifest filename too?
                     let code = generator.generate_model_rs(&model);
-                    std::fs::write(&out, code)
-                        .with_context(|| format!("Failed to write generated code to {:?}", out))?;
+
+                    std::fs::write(&final_out, code).with_context(|| {
+                        format!("Failed to write generated code to {:?}", final_out)
+                    })?;
+
+                    println!("✅ Code generated successfully at {:?}", final_out);
                 }
-            } else {
-                println!(
-                    "🏗️ Generating Candle code from manifest '{:?}'...",
-                    manifest_path
-                );
-
-                let code = generator.generate_model_rs(&model);
-
-                std::fs::write(&out, code)
-                    .with_context(|| format!("Failed to write generated code to {:?}", out))?;
-
-                println!("✅ Code generated successfully at {:?}", out);
             }
         }
-        Commands::Todos { file, check } => {
-            let content = std::fs::read_to_string(&file)
-                .with_context(|| format!("Failed to read file at {:?}", file))?;
-
-            let todos = todos::extract_todos(&content);
-            let report = todos::generate_report(file.to_str().unwrap_or("unknown"), todos);
-
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).context("Failed to serialize report")?
-                );
+        Commands::Todos { path, check } => {
+            let files = if path.is_dir() {
+                // simple recursion or flat for now? Let's just do one level or walkdir if needed.
+                // For now, let's use fs::read_dir and filter .rs
+                std::fs::read_dir(&path)?
+                    .filter_map(|entry| {
+                        let p = entry.ok()?.path();
+                        if p.extension()?.to_str()? == "rs" {
+                            Some(p)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
             } else {
-                println!("📋 TODOs in {:?}:", file);
-                println!("   Total: {}", report.total);
-                if !report.by_type.is_empty() {
-                    println!("\n   By type:");
-                    let mut types: Vec<_> = report.by_type.iter().collect();
-                    types.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
-                    for (t, c) in types {
-                        println!("   - {}: {}", t, c);
-                    }
+                vec![path]
+            };
+
+            let mut any_todos = false;
+
+            for file_path in files {
+                let content = std::fs::read_to_string(&file_path)
+                    .with_context(|| format!("Failed to read file at {:?}", file_path))?;
+
+                let todos = todos::extract_todos(&content);
+                if !todos.is_empty() {
+                    any_todos = true;
                 }
-                if !report.todos.is_empty() {
-                    println!("\n   Details:");
-                    for todo in &report.todos {
-                        println!(
-                            "   L{}: {} ({}) → {}",
-                            todo.line, todo.field_name, todo.module_type, todo.suggestion
-                        );
+
+                let report = todos::generate_report(file_path.to_str().unwrap_or("unknown"), todos);
+
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report)
+                            .context("Failed to serialize report")?
+                    );
+                } else {
+                    println!("📋 TODOs in {:?}:", file_path);
+                    println!("   Total: {}", report.total);
+                    if !report.by_type.is_empty() {
+                        println!("\n   By type:");
+                        let mut types: Vec<_> = report.by_type.iter().collect();
+                        types.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+                        for (t, c) in types {
+                            println!("   - {}: {}", t, c);
+                        }
+                    }
+                    if !report.todos.is_empty() {
+                        println!("\n   Details:");
+                        for todo in &report.todos {
+                            println!(
+                                "   L{}: {} ({}) → {}",
+                                todo.line, todo.field_name, todo.module_type, todo.suggestion
+                            );
+                        }
                     }
                 }
             }
 
-            if check && report.total > 0 {
+            if check && any_todos {
                 std::process::exit(1);
             }
         }

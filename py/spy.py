@@ -18,8 +18,9 @@ class LayerMeta:
     config: Dict[str, Any]
 
 class GoldenRecorder:
-    def __init__(self, output_dir: str = "pycandle_trace"):
+    def __init__(self, output_dir: str = "pycandle_trace", keep_dtype: bool = False):
         self.output_dir = output_dir
+        self.keep_dtype = keep_dtype
         self.records: Dict[str, torch.Tensor] = {}
         self.manifest: Dict[str, LayerMeta] = {}
         self.call_counts = defaultdict(int)
@@ -37,14 +38,22 @@ class GoldenRecorder:
                 # Record actual weight shape for transpose detection
                 "weight_shape": list(module.weight.shape),  # [out, in] in PyTorch
             }
-        elif isinstance(module, nn.Conv1d):
+        elif isinstance(module, nn.Conv1d) or type(module).__name__ == "Conv1d":
             cfg = {
                 "in_channels": module.in_channels,
                 "out_channels": module.out_channels,
-                "kernel_size": module.kernel_size[0],
-                "stride": module.stride[0],
-                "padding": module.padding[0],
+                "kernel_size": module.kernel_size[0] if isinstance(module.kernel_size, (list, tuple)) else module.kernel_size,
+                "stride": module.stride[0] if isinstance(module.stride, (list, tuple)) else module.stride,
+                "padding": module.padding[0] if isinstance(module.padding, (list, tuple)) else module.padding,
                 "bias": module.bias is not None
+            }
+        # HF GPT2 often uses Conv1D
+        elif type(module).__name__ == "Conv1D":
+            cfg = {
+                "in_features": module.weight.shape[0],
+                "out_features": module.weight.shape[1],
+                "bias": module.bias is not None,
+                "weight_shape": list(module.weight.shape)
             }
         elif isinstance(module, nn.LayerNorm):
             cfg = {"normalized_shape": list(module.normalized_shape), "eps": module.eps}
@@ -75,6 +84,12 @@ class GoldenRecorder:
                 cfg = {"in_features": alpha.shape[1]}
             elif alpha.dim() == 1:
                 cfg = {"in_features": alpha.shape[0]}
+        # Custom Transpose
+        elif type(module).__name__ == "Transpose":
+             cfg = {
+                "dim0": getattr(module, "dim0", 1),
+                "dim1": getattr(module, "dim1", 2),
+            }
         
         # GPT2 from HuggingFace transformers
         if hasattr(module, 'config') and hasattr(module.config, 'n_embd'):
@@ -89,7 +104,13 @@ class GoldenRecorder:
 
     def _tensor_to_cpu(self, t: Any) -> Optional[torch.Tensor]:
         if isinstance(t, torch.Tensor):
-            return t.detach().clone().contiguous().float().cpu()
+            if t.device.type == 'meta':
+                # Return placeholder or None
+                return None
+            t = t.detach().clone().contiguous().cpu()
+            if not self.keep_dtype:
+                t = t.float()
+            return t
         return None
 
     def _extract_shapes(self, data: Any) -> List[List[int]]:
@@ -153,11 +174,61 @@ class GoldenRecorder:
         
         return output
 
-    def save(self, project_name: str):
+    def trace_fx(self, model: nn.Module, *example_inputs):
+        """Use torch.fx to capture the computation graph."""
+        import torch.fx as fx
+        
+        # We use a symbolic trace to capture the graph
+        traced = fx.symbolic_trace(model)
+        
+        def serialize_arg(arg):
+            if isinstance(arg, (list, tuple)):
+                return [serialize_arg(a) for a in arg]
+            if hasattr(arg, "name"):
+                return arg.name
+            return str(arg)
+
+        graph_nodes = []
+        for node in traced.graph.nodes:
+            # We want to map these nodes to the modules or functions
+            node_info = {
+                "name": node.name,
+                "op": node.op,
+                "target": str(node.target),
+                "args": [serialize_arg(arg) for arg in node.args],
+            }
+            
+            if node.op == "call_module":
+                try:
+                    submod = traced.get_submodule(node.target)
+                    node_info["module_type"] = type(submod).__name__
+                except:
+                    pass
+            
+            graph_nodes.append(node_info)
+            
+        self._fx_graph = {
+            "graph_nodes": graph_nodes,
+            "graph_code": traced.code
+        }
+        return self._fx_graph
+
+    def save(self, project_name: str, use_fx: bool = False):
         tensor_path = os.path.join(self.output_dir, f"{project_name}_trace.safetensors")
-        save_file(self.records, tensor_path)
+        # Filter out None values (meta placeholders)
+        real_records = {k: v for k, v in self.records.items() if v is not None}
+        if real_records:
+            save_file(real_records, tensor_path)
+        else:
+            print("⚠️ No real tensors recorded (Meta-only mode)")
         
         manifest_path = os.path.join(self.output_dir, f"{project_name}_manifest.json")
+        manifest_data = {k: asdict(v) for k, v in self.manifest.items()}
+        
+        if use_fx and hasattr(self, '_fx_graph'):
+            manifest_data["_graph_nodes"] = self._fx_graph["graph_nodes"]
+            manifest_data["_graph_code"] = self._fx_graph["graph_code"]
+
         with open(manifest_path, "w") as f:
-            json.dump({k: asdict(v) for k, v in self.manifest.items()}, f, indent=4)
+            json.dump(manifest_data, f, indent=4)
         print(f"✅ Trace and Manifest saved for {project_name}")

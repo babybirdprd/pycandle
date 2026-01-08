@@ -10,10 +10,13 @@
 
 mod checker;
 pub mod codegen;
+pub mod gpt2;
 mod layers;
+pub mod samplers;
 
 pub use checker::{ComparisonResult, LayerMeta, PyChecker};
 pub use layers::*;
+pub use samplers::*;
 
 /// Verify tensor against golden record, panics on mismatch
 #[macro_export]

@@ -247,13 +247,13 @@ When parity checks fail:
 - Jupyter notebook template for interactive debugging
 
 ### 🎵 Audio-Specific Ops (pycandle-audio)
-**Status:** Partial (padding implemented, STFT blocked on Candle FFT)
+**Status:** Ready
 
 PyTorch-parity audio operations:
 - ✅ Reflect/Replicate/Constant padding (`pad_1d`)
 - ✅ Hann window generation
-- ⏳ STFT (requires Candle FFT support)
-- ⏳ iSTFT (requires Candle FFT support)
+- ✅ STFT (CPU-based using `realfft`)
+- ✅ iSTFT (CPU-based using `realfft`)
 
 ### 📐 Symbolic Shape Propagation
 **Status:** Planned
@@ -274,6 +274,7 @@ One-command project setup:
 - `pycandle init` - detect project structure, generate recording script
 - Auto-detect model entry points from `pyproject.toml`
 - Generate ready-to-run verification binary
+- Abstract away uv direct usage in cli
 
 ---
 

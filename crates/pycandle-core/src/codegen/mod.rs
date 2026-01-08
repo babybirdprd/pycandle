@@ -29,7 +29,7 @@ pub struct GapInfo {
     pub suggestion: String,
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, serde::Deserialize, Debug, Clone)]
 pub struct LayerInfo {
     pub name: String,
     pub module_type: String,
@@ -38,14 +38,32 @@ pub struct LayerInfo {
     pub output_shapes: Vec<Vec<usize>>,
 }
 
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct GraphNode {
+    pub name: String,
+    pub op: String,
+    pub target: String,
+    pub args: Vec<serde_json::Value>,
+    pub module_type: Option<String>,
+}
+
 /// Code generator that converts manifests to Rust code
 pub struct Codegen {
     manifest: HashMap<String, LayerMeta>,
+    graph_nodes: Option<Vec<GraphNode>>,
 }
 
 impl Codegen {
     pub fn new(manifest: HashMap<String, LayerMeta>) -> Self {
-        Self { manifest }
+        Self {
+            manifest,
+            graph_nodes: None,
+        }
+    }
+
+    pub fn with_graph(mut self, graph_nodes: Vec<GraphNode>) -> Self {
+        self.graph_nodes = Some(graph_nodes);
+        self
     }
 
     /// Analyze the manifest and return a structured result for JSON output
@@ -129,6 +147,15 @@ impl Codegen {
                 | "BatchNorm1d"
                 | "BatchNorm2d"
                 | "LSTM"
+                | "Mish"
+                | "SiLU"
+                | "CausalConv1d"
+                | "Transpose"
+                | "Conv1D"
+                | "Dropout"
+                | "NewGELUActivation"
+                | "LoRACompatibleLinear"
+                | "SinusoidalPosEmb"
         )
     }
 
@@ -138,19 +165,17 @@ impl Codegen {
             "LSTM" => "Use /add-lstm workflow".to_string(),
             "BatchNorm1d" | "BatchNorm2d" => "Use /add-batchnorm workflow".to_string(),
             "Snake" | "ELU" => "Use /add-activations workflow".to_string(),
-            "Dropout" => "Dropout is a no-op at inference time".to_string(),
-            "Conv1D" => "HuggingFace Conv1D - implement as Linear with transpose".to_string(),
             _ => format!("Implement {} manually", module_type),
         }
     }
 
     pub fn generate_model_rs(&self, model_name: &str) -> String {
         let mut code = String::new();
-        code.push_str("use candle_core::{Tensor, Result, Device};\n");
+        code.push_str("use candle_core::{Tensor, Result, Device, Shape};\n");
         code.push_str(
             "use candle_nn::{Linear, Conv1d, LayerNorm, Embedding, VarBuilder, Module};\n",
         );
-        code.push_str("use pycandle_core::{PyChecker, py_check};\n");
+        code.push_str("use pycandle_core::{PyChecker, py_check, Dropout, Transpose, Mish, CausalConv1d, SiLU, ReLU, GELU, Sigmoid, Tanh, ELU, LeakyReLU, Snake, BatchNorm1d, BatchNorm2d, LSTM};\n");
 
         // Add gpt2 import if GPT2 types are present
         if self.has_gpt2_types() {
@@ -214,6 +239,15 @@ impl Codegen {
             "BatchNorm1d" => "BatchNorm1d".to_string(),
             "BatchNorm2d" => "BatchNorm2d".to_string(),
             "LSTM" => "LSTM".to_string(),
+            "Mish" => "Mish".to_string(),
+            "SiLU" => "SiLU".to_string(),
+            "CausalConv1d" => "CausalConv1d".to_string(),
+            "Transpose" => "Transpose".to_string(),
+            "Conv1D" => "Linear".to_string(),
+            "Dropout" => "Dropout".to_string(),
+            "NewGELUActivation" => "candle_nn::Activation".to_string(),
+            "LoRACompatibleLinear" => "Linear".to_string(),
+            "SinusoidalPosEmb" => "SinusoidalPosEmb".to_string(),
             _ => format!("() /* TODO: {} */", py_type),
         }
     }
@@ -248,28 +282,216 @@ impl Codegen {
         code.push_str("        })\n");
         code.push_str("    }\n\n");
 
-        // Forward method
-        code.push_str("    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {\n");
-        code.push_str("        let mut x = xs.clone();\n");
+        if let Some(nodes) = &self.graph_nodes {
+            code.push_str(&self.generate_forward_dag(nodes));
+        } else {
+            // Forward method
+            code.push_str("    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {\n");
+            code.push_str("        let mut x = xs.clone();\n");
 
-        for (layer_name, meta) in &layers {
-            if !meta.is_leaf {
-                continue;
+            for (layer_name, meta) in &layers {
+                if !meta.is_leaf {
+                    continue;
+                }
+                let clean_name = layer_name.replace(".", "_");
+                let forward_call = if self.map_type(&meta.module_type) == "LSTM" {
+                    format!("self.{}.forward(&x)?.0", clean_name)
+                } else {
+                    format!("self.{}.forward(&x)?", clean_name)
+                };
+                code.push_str(&format!("\n        // Layer: {}\n", layer_name));
+                code.push_str(&format!("        x = {};\n", forward_call));
+                code.push_str(&format!(
+                    "        py_check!(self.checker, \"{}\", &x);\n",
+                    layer_name
+                ));
             }
-            let clean_name = layer_name.replace(".", "_");
-            code.push_str(&format!("\n        // Layer: {}\n", layer_name));
-            code.push_str(&format!("        x = self.{}.forward(&x)?;\n", clean_name));
-            code.push_str(&format!(
-                "        py_check!(self.checker, \"{}\", &x);\n",
-                layer_name
-            ));
-        }
 
-        code.push_str("\n        Ok(x)\n");
-        code.push_str("    }\n");
+            code.push_str("\n        Ok(x)\n");
+            code.push_str("    }\n");
+        }
         code.push_str("}\n");
 
         code
+    }
+
+    fn generate_forward_dag(&self, nodes: &[GraphNode]) -> String {
+        let mut code = String::new();
+        code.push_str("    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {\n");
+
+        // Map python placeholder names to Rust input variables
+        let mut var_map = HashMap::new();
+
+        for node in nodes {
+            match node.op.as_str() {
+                "placeholder" => {
+                    // Assume first placeholder is xs
+                    var_map.insert(node.name.clone(), "xs".to_string());
+                }
+                "call_module" => {
+                    let clean_name = node.target.replace(".", "_");
+                    let var_name = format!("x_{}", node.name);
+                    let input_var = if let Some(arg0) = node.args.get(0) {
+                        match arg0 {
+                            serde_json::Value::String(s) => {
+                                var_map.get(s).cloned().unwrap_or(s.clone())
+                            }
+                            _ => "xs".to_string(),
+                        }
+                    } else {
+                        "xs".to_string()
+                    };
+
+                    let forward_call =
+                        if self.map_type(&node.module_type.clone().unwrap_or_default()) == "LSTM" {
+                            format!("self.{}.forward(&{})?.0", clean_name, input_var)
+                        } else {
+                            format!("self.{}.forward(&{})?", clean_name, input_var)
+                        };
+
+                    code.push_str(&format!("        let {} = {};\n", var_name, forward_call));
+                    code.push_str(&format!(
+                        "        py_check!(self.checker, \"{}\", &{});\n",
+                        node.target, var_name
+                    ));
+                    var_map.insert(node.name.clone(), var_name);
+                }
+                "call_function" => {
+                    let var_name = format!("x_{}", node.name);
+                    let mut resolved_args = Vec::new();
+                    for arg in &node.args {
+                        resolved_args.push(self.resolve_fx_arg(arg, &var_map));
+                    }
+
+                    let expr = self.map_fx_op(&node.target, &resolved_args);
+                    code.push_str(&format!("        let {} = {};\n", var_name, expr));
+                    var_map.insert(node.name.clone(), var_name);
+                }
+                "call_method" => {
+                    let var_name = format!("x_{}", node.name);
+                    let mut resolved_args = Vec::new();
+                    for arg in &node.args {
+                        resolved_args.push(self.resolve_fx_arg(arg, &var_map));
+                    }
+
+                    if !resolved_args.is_empty() {
+                        let self_var = &resolved_args[0];
+                        let method_args = &resolved_args[1..];
+                        let expr = self.map_fx_method(&node.target, self_var, method_args);
+                        code.push_str(&format!("        let {} = {};\n", var_name, expr));
+                        var_map.insert(node.name.clone(), var_name);
+                    }
+                }
+                "output" => {
+                    let out_var = if let Some(arg0) = node.args.get(0) {
+                        match arg0 {
+                            serde_json::Value::String(s) => {
+                                var_map.get(s).cloned().unwrap_or(s.clone())
+                            }
+                            _ => "xs".to_string(),
+                        }
+                    } else {
+                        "xs".to_string()
+                    };
+                    code.push_str(&format!("        Ok({})\n", out_var));
+                }
+                _ => {}
+            }
+        }
+
+        code.push_str("    }\n");
+        code
+    }
+
+    fn resolve_fx_arg(&self, arg: &serde_json::Value, var_map: &HashMap<String, String>) -> String {
+        match arg {
+            serde_json::Value::String(s) => var_map.get(s).cloned().unwrap_or(s.clone()),
+            serde_json::Value::Array(arr) => {
+                let items: Vec<String> = arr
+                    .iter()
+                    .map(|v| self.resolve_fx_arg(v, var_map))
+                    .collect();
+                format!("&[{}]", items.join(", "))
+            }
+            _ => arg.to_string(),
+        }
+    }
+
+    fn map_fx_op(&self, target: &str, args: &[String]) -> String {
+        let target_lower = target.to_lowercase();
+        if target_lower.contains("add") {
+            return format!("(&{} + &{})?", args[0], args[1]);
+        }
+        if target_lower.contains("sub") {
+            return format!("(&{} - &{})?", args[0], args[1]);
+        }
+        if target_lower.contains("mul") {
+            return format!("(&{} * &{})?", args[0], args[1]);
+        }
+        if target_lower.contains("div") || target_lower.contains("truediv") {
+            return format!("(&{} / &{})?", args[0], args[1]);
+        }
+        if target_lower.contains("cat") {
+            let dim = args.get(1).map(|s| s.as_str()).unwrap_or("1");
+            return format!("Tensor::cat({}, {})?", args[0], dim);
+        }
+
+        match target {
+            "torch.add" | "<built-in function add>" | "add" => {
+                format!("(&{} + &{})?", args[0], args[1])
+            }
+            "torch.cat" | "cat" => {
+                let dim = args.get(1).map(|s| s.as_str()).unwrap_or("1");
+                format!("Tensor::cat({}, {})?", args[0], dim)
+            }
+            "torch.relu" | "relu" => format!("{}.relu()?", args[0]),
+            "torch.sigmoid" | "sigmoid" => format!("candle_nn::ops::sigmoid(&{})?", args[0]),
+            "torch.tanh" | "tanh" => format!("{}.tanh()?", args[0]),
+            "operator.getitem" => {
+                // Often used for slicing or getting a member.
+                // args[0] is the tensor, args[1] is the index
+                format!("{}.get({})?", args[0], args[1])
+            }
+            _ => format!("todo!(/* function: {} */)", target),
+        }
+    }
+
+    fn map_fx_method(&self, method: &str, self_var: &str, args: &[String]) -> String {
+        match method {
+            "view" | "reshape" => {
+                // PyTorch view often has (-1) or (B, -1).
+                // We need to map it to Candle reshape.
+                // args might be (shape_list)
+                if args.len() == 1 && args[0].starts_with("&[") {
+                    format!("{}.reshape({})?", self_var, args[0])
+                } else {
+                    format!("{}.reshape(vec![{}])?", self_var, args.join(", "))
+                }
+            }
+            "flatten" => {
+                format!("{}.flatten_all()?", self_var)
+            }
+            "transpose" => {
+                format!("{}.transpose({}, {})?", self_var, args[0], args[1])
+            }
+            "permute" => {
+                format!("{}.permute({})?", self_var, args[0])
+            }
+            "t" => {
+                format!("{}.t()?", self_var)
+            }
+            "contiguous" => {
+                format!("{}.contiguous()?", self_var)
+            }
+            "size" => {
+                if args.is_empty() {
+                    format!("{}.dims().to_vec()", self_var)
+                } else {
+                    format!("{}.dim({})?", self_var, args[0])
+                }
+            }
+            _ => format!("todo!(/* method: {} on {} */)", method, self_var),
+        }
     }
 
     fn generate_init(&self, layer_name: &str, meta: &LayerMeta) -> String {
@@ -280,7 +502,7 @@ impl Codegen {
 
         // Core types
         match meta.module_type.as_str() {
-            "Linear" => {
+            "Linear" | "LoRACompatibleLinear" => {
                 let in_f = meta.config["in_features"].as_u64().unwrap_or(0);
                 let out_f = meta.config["out_features"].as_u64().unwrap_or(0);
                 let bias = meta.config["bias"].as_bool().unwrap_or(true);
@@ -338,9 +560,15 @@ impl Codegen {
                     serde_json::from_value(meta.config["normalized_shape"].clone())
                         .unwrap_or_default();
                 let eps = meta.config["eps"].as_f64().unwrap_or(1e-5);
+                // Use a single value if shape is [N], otherwise use a Slice
+                let shape_str = if shape.len() == 1 {
+                    format!("{}", shape[0])
+                } else {
+                    format!("Shape::from(vec!{:?})", shape)
+                };
                 format!(
-                    "candle_nn::layer_norm(vec!{:?}, candle_nn::LayerNormConfig {{ eps: {:.1e}, ..Default::default() }}, vb.pp(\"{}\"))?",
-                    shape, eps, layer_name
+                    "candle_nn::layer_norm({}, candle_nn::LayerNormConfig {{ eps: {:.1e}, ..Default::default() }}, vb.pp(\"{}\"))?",
+                    shape_str, eps, layer_name
                 )
             }
             "Embedding" => {
@@ -423,6 +651,50 @@ impl Codegen {
                     "LSTM::load(vb.pp(\"{}\"), {}, {}, {})?",
                     layer_name, input_size, hidden_size, num_layers
                 )
+            }
+            "CausalConv1d" => {
+                let in_c = meta.config["in_channels"].as_u64().unwrap_or(0);
+                let out_c = meta.config["out_channels"].as_u64().unwrap_or(0);
+                let k = meta.config["kernel_size"].as_u64().unwrap_or(0);
+                let s = meta.config["stride"].as_u64().unwrap_or(1);
+                let bias = meta.config["bias"].as_bool().unwrap_or(true);
+                format!(
+                    "CausalConv1d::load(vb.pp(\"{}\"), {}, {}, {}, {}, {})?",
+                    layer_name, in_c, out_c, k, s, bias
+                )
+            }
+            "Mish" => "Mish".to_string(),
+            "SiLU" => "SiLU".to_string(),
+            // GPT2 specific
+            "Conv1D" => {
+                let out_f = meta.config["nf"].as_u64().unwrap_or(0);
+                // In GPT2, weights are (nx, nf), so no transpose needed relative to standard HF Conv1D logic
+                // But Candle Linear wants (out, in).
+                // "weight_shape" should guide us.
+                // Assuming we use standard Linear and handle weights in loading.
+                let nx_guess =
+                    if let Some(ws) = meta.config.get("weight_shape").and_then(|v| v.as_array()) {
+                        // (nx, nf)
+                        ws.get(0).and_then(|x| x.as_u64()).unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                format!(
+                    "candle_nn::linear({}, {}, vb.pp(\"{}\"))?",
+                    nx_guess, out_f, layer_name
+                )
+            }
+            "NewGELUActivation" => "candle_nn::Activation::NewGelu".to_string(),
+            "Dropout" => "Dropout::new()".to_string(),
+            "Transpose" => {
+                let d0 = meta.config["dim0"].as_u64().unwrap_or(1);
+                let d1 = meta.config["dim1"].as_u64().unwrap_or(2);
+                format!("Transpose::new({}, {})", d0, d1)
+            }
+            "SinusoidalPosEmb" => {
+                let dim = meta.output_shapes[0][1];
+                format!("SinusoidalPosEmb::new({})", dim)
             }
             _ => format!(
                 "todo!(\"Implement initialization for {}\")",

@@ -24,6 +24,8 @@ thiserror = "1.0"
 anyhow = "1.0"
 walkdir = "2.4"
 regex = "1.10"
+realfft = "3.3"
+num-complex = "0.4"
 
 # Internal crates
 pycandle-core = { path = "crates/pycandle-core" }

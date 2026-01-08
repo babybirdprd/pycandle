@@ -131,31 +131,195 @@ pub fn hann_window(length: usize, device: &candle_core::Device) -> Result<Tensor
 }
 
 /// Short-time Fourier Transform (STFT)
-///
-/// NOTE: This is a placeholder. Full implementation requires:
-/// - Frame extraction with proper striding
-/// - Windowing
-/// - Real FFT (requires candle FFT support or external crate)
-///
-/// For now, audio models should use pre-computed spectrograms or
-/// integrate with a Python preprocessing step.
-pub fn stft(_input: &Tensor, _config: &StftConfig) -> Result<Tensor> {
-    // TODO: Implement STFT when Candle adds FFT support
-    // See roadmap in README
-    Err(candle_core::Error::Msg(
-        "STFT not yet implemented - see README roadmap".to_string(),
-    ))
+pub fn stft(input: &Tensor, config: &StftConfig, window: Option<&Tensor>) -> Result<Tensor> {
+    let device = input.device();
+    let dtype = input.dtype();
+
+    // 1. Padding
+    let n_fft = config.n_fft;
+    let hop_length = config.hop_length.unwrap_or(n_fft / 4);
+    let win_length = config.win_length.unwrap_or(n_fft);
+
+    let mut x = input.clone();
+    if config.center {
+        let pad = n_fft / 2;
+        x = pad_1d(&x, pad, pad, config.pad_mode)?;
+    }
+
+    // 2. Framing & Windowing
+    // x is (B, T) or (T,)
+    let dims = x.dims();
+    let (batch_size, time_len) = if dims.len() == 1 {
+        (1, dims[0])
+    } else if dims.len() == 2 {
+        (dims[0], dims[1])
+    } else {
+        return Err(candle_core::Error::Msg(format!(
+            "STFT input must be (B, T) or (T,), got {:?}",
+            dims
+        )));
+    };
+
+    let n_frames = (time_len - win_length) / hop_length + 1;
+
+    // Move to CPU for FFT if on GPU
+    let x_cpu = x.to_device(&candle_core::Device::Cpu)?;
+    let x_vec = x_cpu.flatten_all()?.to_vec1::<f32>()?;
+
+    let window_vec = if let Some(w) = window {
+        w.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?
+    } else {
+        vec![1.0; win_length]
+    };
+
+    // 3. FFT Setup
+    let mut planner = realfft::RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(n_fft);
+
+    let n_bins = n_fft / 2 + 1;
+    let mut output_vec = vec![0.0f32; batch_size * n_frames * n_bins * 2];
+
+    for b in 0..batch_size {
+        let batch_offset = b * time_len;
+        let out_batch_offset = b * n_bins * n_frames * 2;
+        for f in 0..n_frames {
+            let start = batch_offset + f * hop_length;
+            let mut frame = vec![0.0f32; n_fft];
+
+            // Apply window and copy into frame (handling win_length < n_fft with zero padding)
+            for i in 0..win_length {
+                frame[i] = x_vec[start + i] * window_vec[i];
+            }
+
+            let mut spectrum = r2c.make_output_vec();
+            r2c.process(&mut frame, &mut spectrum)
+                .map_err(|e| candle_core::Error::Msg(format!("FFT error: {:?}", e)))?;
+
+            for (i, c) in spectrum.iter().enumerate() {
+                let out_idx = out_batch_offset + (i * n_frames + f) * 2;
+                output_vec[out_idx] = c.re;
+                output_vec[out_idx + 1] = c.im;
+            }
+        }
+    }
+
+    // 4. Result Formatting
+    let shape = if batch_size == 1 && dims.len() == 1 {
+        candle_core::Shape::from((n_bins, n_frames, 2usize))
+    } else {
+        candle_core::Shape::from((batch_size, n_bins, n_frames, 2usize))
+    };
+
+    let result = Tensor::from_vec(output_vec, shape, &candle_core::Device::Cpu)?;
+
+    // Move back to original device and dtype
+    result.to_device(device)?.to_dtype(dtype)
 }
 
 /// Inverse Short-time Fourier Transform (iSTFT)
-///
-/// NOTE: This is a placeholder. Requires STFT implementation first.
-pub fn istft(_input: &Tensor, _config: &StftConfig) -> Result<Tensor> {
-    // TODO: Implement iSTFT when Candle adds FFT support
-    // See roadmap in README
-    Err(candle_core::Error::Msg(
-        "iSTFT not yet implemented - see README roadmap".to_string(),
-    ))
+pub fn istft(input: &Tensor, config: &StftConfig, window: Option<&Tensor>) -> Result<Tensor> {
+    let device = input.device();
+    let dtype = input.dtype();
+
+    let n_fft = config.n_fft;
+    let hop_length = config.hop_length.unwrap_or(n_fft / 4);
+    let win_length = config.win_length.unwrap_or(n_fft);
+
+    // input is (B, n_bins, n_frames, 2) or (n_bins, n_frames, 2)
+    let dims = input.dims();
+    let (batch_size, n_bins, n_frames) = if dims.len() == 3 {
+        (1, dims[0], dims[1])
+    } else if dims.len() == 4 {
+        (dims[0], dims[1], dims[2])
+    } else {
+        return Err(candle_core::Error::Msg(format!(
+            "iSTFT input must be (B, n_bins, n_frames, 2) or (n_bins, n_frames, 2), got {:?}",
+            dims
+        )));
+    };
+
+    if n_bins != n_fft / 2 + 1 {
+        return Err(candle_core::Error::Msg(format!(
+            "Expected {} bins for n_fft={}, got {}",
+            n_fft / 2 + 1,
+            n_fft,
+            n_bins
+        )));
+    }
+
+    // Move to CPU
+    let input_cpu = input.to_device(&candle_core::Device::Cpu)?;
+    let input_vec = input_cpu.flatten_all()?.to_vec1::<f32>()?;
+
+    let window_vec = if let Some(w) = window {
+        w.to_device(&candle_core::Device::Cpu)?.to_vec1::<f32>()?
+    } else {
+        vec![1.0; win_length]
+    };
+
+    // 2. Inverse FFT Setup
+    let mut planner = realfft::RealFftPlanner::<f32>::new();
+    let c2r = planner.plan_fft_inverse(n_fft);
+
+    let mut output_audio = Vec::with_capacity(batch_size * (n_frames * hop_length + n_fft));
+
+    for b in 0..batch_size {
+        let batch_offset = b * n_bins * n_frames * 2;
+        let expected_len = n_frames * hop_length + n_fft;
+        let mut reconstructed = vec![0.0f32; expected_len];
+        let mut window_sum = vec![0.0f32; expected_len];
+
+        for f in 0..n_frames {
+            let start = f * hop_length;
+            let mut spectrum = Vec::with_capacity(n_bins);
+            for i in 0..n_bins {
+                let idx = batch_offset + (i * n_frames + f) * 2;
+                spectrum.push(num_complex::Complex::new(
+                    input_vec[idx],
+                    input_vec[idx + 1],
+                ));
+            }
+
+            let mut frame = c2r.make_output_vec();
+            c2r.process(&mut spectrum, &mut frame)
+                .map_err(|e| candle_core::Error::Msg(format!("iFFT error: {:?}", e)))?;
+
+            // Normalize iFFT (realfft doesn't normalize by default)
+            let norm = 1.0 / n_fft as f32;
+            for i in 0..win_length {
+                reconstructed[start + i] += frame[i] * norm * window_vec[i];
+                window_sum[start + i] += window_vec[i] * window_vec[i];
+            }
+        }
+
+        // Apply OLA normalization (Over-Lap Add)
+        for i in 0..reconstructed.len() {
+            if window_sum[i] > 1e-10 {
+                reconstructed[i] /= window_sum[i];
+            }
+        }
+
+        output_audio.extend_from_slice(&reconstructed);
+    }
+
+    // 3. Finalize and Crop
+    let mut result = Tensor::from_vec(
+        output_audio,
+        (batch_size, n_frames * hop_length + n_fft),
+        &candle_core::Device::Cpu,
+    )?;
+
+    if config.center {
+        let pad = n_fft / 2;
+        let total_len = result.dim(1)?;
+        result = result.narrow(1, pad, total_len - 2 * pad)?;
+    }
+
+    if batch_size == 1 && dims.len() == 3 {
+        result = result.squeeze(0)?;
+    }
+
+    result.to_device(device)?.to_dtype(dtype)
 }
 
 #[cfg(test)]
@@ -172,5 +336,45 @@ mod tests {
         assert!((data[1] - 0.5).abs() < 1e-5);
         assert!((data[2] - 1.0).abs() < 1e-5);
         assert!((data[3] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_stft_istft_roundtrip() {
+        let device = candle_core::Device::Cpu;
+        let config = StftConfig {
+            n_fft: 16,
+            hop_length: Some(4),
+            win_length: Some(16),
+            center: true,
+            pad_mode: PadMode::Reflect,
+            ..Default::default()
+        };
+
+        // Create a simple signal: sum of sines
+        let mut signal = vec![0.0f32; 64];
+        for i in 0..64 {
+            signal[i] = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16000.0).sin();
+        }
+        let x = Tensor::from_vec(signal, (64,), &device).unwrap();
+        let window = hann_window(config.win_length.unwrap(), &device).unwrap();
+
+        let spec = stft(&x, &config, Some(&window)).unwrap();
+        let x_hat = istft(&spec, &config, Some(&window)).unwrap();
+
+        let x_vec = x.to_vec1::<f32>().unwrap();
+        let x_hat_vec = x_hat.to_vec1::<f32>().unwrap();
+
+        // Roundtrip should be reasonably close
+        // Note: OLA with Hann window and hop=4 (n_fft/4) meets COLA
+        for i in 4..60 {
+            // Avoid edges due to OLA ramp-up/down if not perfectly handled by padding
+            assert!(
+                (x_vec[i] - x_hat_vec[i]).abs() < 1e-3,
+                "At index {}: {} != {}",
+                i,
+                x_vec[i],
+                x_hat_vec[i]
+            );
+        }
     }
 }

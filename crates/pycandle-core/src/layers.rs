@@ -2,6 +2,8 @@
 //!
 //! These provide PyTorch-compatible implementations that Candle doesn't have built-in.
 
+use candle_nn::Module;
+
 use candle_core::{IndexOp, Result, Tensor};
 
 // ============================================================================
@@ -86,6 +88,25 @@ impl Snake {
         let sin_ax = ax.sin()?;
         let sin_sq = sin_ax.sqr()?;
         x + sin_sq.broadcast_div(&self.alpha)?
+    }
+}
+
+/// Mish activation: x * tanh(softplus(x))
+pub struct Mish;
+impl Mish {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Mish(x) = x * tanh(softplus(x))
+        // softplus(x) = ln(1 + exp(x))
+        let sp = (x.exp()? + 1.0)?.log()?;
+        x.broadcast_mul(&sp.tanh()?)
+    }
+}
+
+/// SiLU / Swish activation: x * sigmoid(x)
+pub struct SiLU;
+impl SiLU {
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        x * candle_nn::ops::sigmoid(x)?
     }
 }
 
@@ -280,5 +301,100 @@ impl LSTM {
         }
 
         Ok((output, (h, c)))
+    }
+}
+
+// ============================================================================
+// Specialized Layers
+// ============================================================================
+
+/// CausalConv1d: A 1D convolution with causal padding
+/// Ensures that output at time t only depends on inputs at time <= t
+pub struct CausalConv1d {
+    pub conv: candle_nn::Conv1d,
+    pub padding: usize,
+}
+
+impl CausalConv1d {
+    pub fn load(
+        vb: candle_nn::VarBuilder,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        bias: bool,
+    ) -> Result<Self> {
+        let padding = kernel_size - 1;
+        let config = candle_nn::Conv1dConfig {
+            stride,
+            padding,
+            ..Default::default()
+        };
+        let conv = if bias {
+            candle_nn::conv1d(in_channels, out_channels, kernel_size, config, vb)?
+        } else {
+            candle_nn::conv1d_no_bias(in_channels, out_channels, kernel_size, config, vb)?
+        };
+        Ok(Self { conv, padding })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = self.conv.forward(x)?;
+        // Causal slice: remove the 'future' padding at the end
+        if self.padding > 0 {
+            let dim = x.dims().len() - 1;
+            let seq_len = x.dim(dim)?;
+            x.narrow(dim, 0, seq_len - self.padding)
+        } else {
+            Ok(x)
+        }
+    }
+}
+
+/// Dropout layer (inference no-op)
+pub struct Dropout {
+    pub p: f32,
+}
+impl Dropout {
+    pub fn new() -> Self {
+        Self { p: 0.5 }
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        Ok(x.clone())
+    }
+}
+
+/// Transpose layer (swaps two dimensions)
+pub struct Transpose {
+    pub dim0: usize,
+    pub dim1: usize,
+}
+impl Transpose {
+    pub fn new(dim0: usize, dim1: usize) -> Self {
+        Self { dim0, dim1 }
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        x.transpose(self.dim0, self.dim1)
+    }
+}
+
+/// Sinusoidal Positional Embedding
+pub struct SinusoidalPosEmb {
+    pub dim: usize,
+}
+impl SinusoidalPosEmb {
+    pub fn new(dim: usize) -> Self {
+        Self { dim }
+    }
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let half_dim = self.dim / 2;
+        let device = x.device();
+        let dtype = x.dtype();
+        let inv_freq: Vec<_> = (0..half_dim)
+            .map(|i| 1.0f32 / (10000.0f32.powf(i as f32 / (half_dim as f32 - 1.0f32))))
+            .collect();
+        let inv_freq = Tensor::from_vec(inv_freq, half_dim, device)?.to_dtype(dtype)?;
+        let emb = x.unsqueeze(1)?.broadcast_mul(&inv_freq.unsqueeze(0)?)?;
+        Tensor::cat(&[emb.sin()?, emb.cos()?], 1)
     }
 }

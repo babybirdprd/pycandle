@@ -9,3 +9,5 @@ license.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true
 thiserror.workspace = true
+realfft.workspace = true
+num-complex.workspace = true
