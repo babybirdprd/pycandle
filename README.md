@@ -216,76 +216,74 @@ pycandle-audio = { git = "https://github.com/user/pycandle" }
 
 ## Roadmap
 
-These features are planned or currently in development to move PyCandle from a utility to a production-grade transpilation framework:
+PyCandle has evolved into a high-fidelity transpilation framework. The following items track the transition from v0.1 to a production-grade v1.0.
 
 ### 🔄 DAG Resolver (torch.fx Tracing)
 **Status:** Complete ✅
 
 Handle non-sequential models with skip connections and branches:
-- Use `torch.fx` to trace computation graphs automatically via `recorder.record(model, x, trace_fx=True)`
-- Generate named variables based on FX graph nodes instead of sequential `x = layer(x)`
-- Automatic residual detection: `let out = (&x_bn2 + &xs)?;`
-- Support for tensor concatenation, branching, and common tensor methods (`view`, `reshape`, `flatten`, etc.)
+- Use `torch.fx` to trace computation graphs automatically.
+- Generate named variables based on FX graph nodes (e.g., `let x_conv1 = ...`).
+- Automatic residual detection and mapping of functional ops (`add`, `cat`, `mul`).
+- Mapping of `operator.getitem` to Candle `.i()` for complex slicing logic.
 
 ### 📐 Symbolic Shape Propagation
 **Status:** Complete ✅
 
-Generate Config structs instead of hardcoded dimensions. This decouples the model logic from specific input sizes:
-```rust
-pub struct Config {
-    pub context_length: usize, // 1024
-    pub hidden_dim: usize,     // 768
-    pub vocab_size: usize,     // 50257
-}
-```
+Generate `Config` structs instead of hardcoded dimensions to decouple model logic from specific input sizes:
+- Automatic detection of `vocab_size`, `hidden_dim`, and `context_length`.
+- Config-driven initialization in the generated Rust `load` functions.
 
 ### 📊 Visual Drift Analysis (Mechanistic Diagnostics)
 **Status:** Complete ✅
 
-Enhanced diagnostics for numerical drift using real verification data:
-- **Live Data Ingestion:** Update `PyChecker` to export `verification_results.json` which populates the D3.js report.
-- **MSE Heatmap:** Visual representation of "Math Leakage" across layers.
-- **Point of Divergence:** Automatically highlight the exact layer where `Cosine Similarity` drops below `0.99`.
+Enhanced diagnostics for numerical drift using real-time verification data:
+- **D3.js Coverage Report:** Standalone HTML report with MSE/Cosine Similarity charts.
+- **Divergence Detection:** Automatic identification of the "Point of Failure" where math starts to drift.
+- **TUI Dashboard:** Real-time terminal dashboard with 8x8 error heatmaps for instant visual feedback.
 
 ### 🎵 Audio-Specific Ops (pycandle-audio)
 **Status:** Complete ✅
 
-PyTorch-parity audio operations:
-- [x] Reflect/Replicate/Constant padding (`pad_1d`)
-- [x] Hann window generation
-- [x] STFT/iSTFT (CPU-based using `realfft`)
-- [x] Bit-perfect `MelSpectrogram` implementation matching `torchaudio.transforms` (including Slaney-scale parity).
+Bit-perfect PyTorch parity for audio preprocessing and specialized layers:
+- **MelSpectrogram:** Full parity with `torchaudio` (including Slaney-scale area normalization).
+- **STFT/iSTFT:** High-precision CPU-based transforms using `realfft`.
+- **Specialized Layers:** Native support for `Snake` (BigVGAN), `CausalConv1d`, and `Mish`.
 
-### 🛠️ Advanced FX Logic Mapping
+### 🔬 Interactive Debugger (Lock-Step)
 **Status:** Complete ✅
 
-Expanding the DAG resolver to handle complex Pythonic tensor manipulation:
-- **Slicing/Indexing:** Map PyTorch `x[:, :10]` (operator.getitem) to Candle `.narrow()` or `.i()`.
-- **Tuple/Multi-Output:** Support for modules that return multiple tensors (e.g., Attention weights or RNN hidden states).
-- **Chunk/Split:** Native mapping for `torch.chunk` and `torch.split` used in GLU activations.
+Automated post-mortem tools for failed parity checks:
+- **Snippet Generation:** Automatically saves `.safetensors` containing the failing Rust tensor and the Golden reference.
+- **Python Debug Scripts:** Generates a ready-to-run `.py` script that loads the failure snippet into Matplotlib for visual histogram/heatmap comparison.
 
 ### 📦 Surgical Weight Management
 **Status:** Complete ✅
 
 Tools to handle the "Integration Gap" between PyTorch checkpoints and Rust structs:
-- **Checkpoint Mapper:** JSON-based renaming engine to map PyTorch keys (`encoder.block.0`) to Rust field names (`h.0`) without code changes.
-- **Meta-Extractor:** CLI tool to read a multi-gigabyte PyTorch file and extract *only* the tensors defined in the `manifest.json`, renaming them on the fly for Candle.
+- **Checkpoint Mapper:** Regex-based renaming engine to map PyTorch keys to Rust fields.
+- **Meta-Extractor:** CLI tool to surgically extract only the weights used in a manifest, significantly reducing checkpoint size.
 
-### 🔬 Interactive Debugger (Lock-Step)
-**Status:** Complete ✅
-
-When a `py_check!` fails in Rust:
-- Save a `.safetensors` snippet containing the erroneous Rust tensor and the Golden reference.
-- Generate a Python comparison script for side-by-side inspection in a Jupyter notebook.
-- ASCII terminal "Mini-Heatmap" for quick debugging in CI environments.
-
-### ⚡ Minimal Developer Code
+### 🧪 Automated Test Generation
 **Status:** Planned
 
-One-command project setup:
-- `pycandle init` - Detect project structure and generate a boilerplate recording script.
-- Auto-detect model entry points from `pyproject.toml`.
-- Generate ready-to-run verification binaries automatically.
+Eliminate manual test writing by generating the full Rust test harness:
+- **Auto-Test CLI:** `pycandle gen-test` to generate `tests/parity.rs` automatically.
+- **Data-Driven Harness:** The test will automatically load the input/output tensors from the recorded trace and run the verification loop.
+
+### 🧩 Symbolic Ambiguity Hints
+**Status:** In Progress 🛠️
+
+Refining the symbolic propagator for complex models:
+- **Hint System:** Allow users to provide a `hints.json` to resolve ambiguous dimensions (e.g., when `hidden_dim` and `context_length` are both 1024).
+- **Dynamic Sequence Support:** Improved handling of variable-length audio/text sequences in the generated Rust code.
+
+### 📉 Quantization Parity (GGUF/AWQ)
+**Status:** Planned
+
+Extending the verification engine to quantized models:
+- **Quantization Drift Tracking:** Measure MSE drift introduced specifically by `Q4_0`, `Q8_0`, or `AWQ` compared to the `f32` Golden Record.
+- **Parity-Aware Quantization:** Identify which specific layers are most sensitive to quantization to help guide mixed-precision strategies.
 
 ---
 
@@ -293,8 +291,7 @@ One-command project setup:
 1.  **Python Spy:** Captures Graph (FX) + Config + Activations + Weights.
 2.  **Transpiler:** Converts FX Graph to idiomatic Rust DAG (with residuals).
 3.  **Verifiable Crate:** Generated code with `py_check!` macros that "lights up" green as you implement layers.
-4.  **Diagnostics:** A visual report showing exactly where the "Math Leak" is happening.
-
+4.  **Diagnostics:** A visual report and Python debug scripts showing exactly where the "Math Leak" is happening.
 ---
 
 ## License

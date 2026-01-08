@@ -3,6 +3,7 @@
 //! Command-line interface for PyTorch → Candle porting.
 
 mod dashboard;
+mod init;
 mod report;
 mod todos;
 
@@ -90,6 +91,12 @@ enum Commands {
         // Optional arguments if we want to pass filter to cargo test
         #[arg(last = true)]
         args: Vec<String>,
+    },
+    /// Initialize a new project with boilerplate
+    Init {
+        /// Optional project name
+        #[arg(short, long)]
+        name: Option<String>,
     },
 }
 
@@ -402,6 +409,9 @@ fn main() -> Result<()> {
         },
         Commands::Dashboard { args } => {
             dashboard::run_dashboard(&args)?;
+        }
+        Commands::Init { name } => {
+            init::run_init(name)?;
         }
     }
 

@@ -1,0 +1,56 @@
+name: Parity Check
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  parity-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    # 1. Setup Rust
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    # 2. Setup Python & UV
+    - name: Install uv
+      uses: astral-sh/setup-uv@v2
+      with:
+        python-version: '3.12'
+
+    - name: Install Python dependencies
+      run: uv pip install torch pycandle-core
+
+    # 3. Compile PyCandle CLI (or use pre-built if available)
+    # For now, we assume we build it from source in the workspace
+    - name: Build PyCandle CLI
+      run: cargo build --release --bin pycandle
+
+    # 4. Generate Traces (Simulating 'pycandle record')
+    # Assuming 'recorder.py' is in the root as per SOP
+    - name: Generate Traces
+      run: uv run recorder.py
+      env:
+        # Ensure we can find local pycandle if not installed
+        PYTHONPATH: ${{ github.workspace }}/py
+
+    # 5. Generate Code (Optional if committed, but good to verify codegen runs)
+    # If the user committed generated code, this step might be skipped or used to check for drift
+    - name: Run Codegen (Verify)
+      run: |
+        ./target/release/pycandle codegen \
+          --manifest traces/debug_run_manifest.json \
+          --out generated_model.rs \
+          --model MyModel \
+          --analyze-only
+
+    # 6. Run Parity Tests
+    - name: Run Parity Tests
+      run: cargo test --test parity
