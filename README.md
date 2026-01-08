@@ -293,6 +293,32 @@ Extending the verification engine to quantized models:
 3.  **Verifiable Crate:** Generated code with `py_check!` macros that "lights up" green as you implement layers.
 4.  **Diagnostics:** A visual report and Python debug scripts showing exactly where the "Math Leak" is happening.
 ---
+### The "Universal Transpiler" Roadmap (ONNX Edition)
+
+#### 🌐 Universal ONNX Transpilation
+**Status: Researching 🔍**
+- **Direct Graph Parsing:** Generate Candle Rust code directly from `.onnx` files without requiring Python source code.
+- **Operator Mapping:** Translation layer to map standard ONNX Ops (Opset 15-21) to optimized Candle kernels.
+- **Multi-Framework Support:** Enable porting from JAX and TensorFlow to Candle via the ONNX intermediate representation.
+- **Reference Parity:** Support `onnxruntime` as a verification backend for `PyChecker`.
+
+---
+
+### Technical Challenges to Watch For:
+1.  **The "Opset" Nightmare:** ONNX has many versions (Opsets). You’ll need to focus on the most common ones (Opset 17+).
+2.  **Naming Conventions:** ONNX often renames layers to generic IDs (like `node_1`, `node_2`). This makes the generated Rust code harder to read than your current `torch.fx` approach, which keeps the original PyTorch names.
+3.  **Complex Ops:** Some ONNX ops (like `EinsteinSum` or complex `Loop` nodes) are very hard to map to Candle.
+
+### Should you do it?
+**Yes, but as an alternative input.** 
+Keep the `torch.fx` path as the "Primary" because it produces the most readable, idiomatic Rust code. Use ONNX as the "Emergency/Universal" path for when the original source code isn't available.
+
+**PyCandle would then be:**
+*   **Input:** PyTorch Code OR ONNX File.
+*   **Process:** Trace + Analyze + Codegen.
+*   **Output:** Verified, Production-Grade Rust.
+
+---
 
 ## License
 

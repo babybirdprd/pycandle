@@ -5,6 +5,7 @@
 mod dashboard;
 mod init;
 mod report;
+mod test_gen;
 mod todos;
 
 use anyhow::{Context, Result};
@@ -97,6 +98,16 @@ enum Commands {
         /// Optional project name
         #[arg(short, long)]
         name: Option<String>,
+    },
+    /// Generate automated parity test
+    GenTest {
+        /// Name of the model struct (must match generated code)
+        #[arg(long, default_value = "MyModel")]
+        model: String,
+
+        /// Output path for the generated test file
+        #[arg(short, long, default_value = "tests/parity.rs")]
+        out: PathBuf,
     },
 }
 
@@ -412,6 +423,21 @@ fn main() -> Result<()> {
         }
         Commands::Init { name } => {
             init::run_init(name)?;
+        }
+        Commands::GenTest { model, out } => {
+            println!("🧪 Generating test harness for model '{}'...", model);
+            let generator = test_gen::TestGenerator::new(model);
+            let code = generator.generate_test_file();
+
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create directory {:?}", parent))?;
+            }
+
+            std::fs::write(&out, code)
+                .with_context(|| format!("Failed to write test file to {:?}", out))?;
+
+            println!("✅ Test generated at {:?}", out);
         }
     }
 

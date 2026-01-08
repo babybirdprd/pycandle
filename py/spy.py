@@ -159,6 +159,13 @@ class GoldenRecorder:
 
     def record(self, model: nn.Module, *args, trace_fx: bool = False, **kwargs):
         model.eval()
+        
+        # Record model inputs
+        for i, arg in enumerate(args):
+            cpu_arg = self._tensor_to_cpu(arg)
+            if cpu_arg is not None:
+                self.records[f"model_input.{i}"] = cpu_arg
+
         hooks = []
         for name, module in model.named_modules():
             if name == "": continue 
