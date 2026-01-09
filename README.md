@@ -120,6 +120,20 @@ recorder.save("project_name")  # Saves .safetensors + _manifest.json
 - `{name}_trace.safetensors` - Activation tensors for each layer
 - `{name}_manifest.json` - Module metadata (types, shapes, configs)
 
+### Advanced: Resolving Symbolic Ambiguity (Hints)
+
+If your model has multiple dimensions with the same size (e.g., `hidden_dim=1024` and `context_length=1024`), the symbolic propagator might pick the wrong one. You can resolve this by passing `hints` to `recorder.save()`:
+
+```python
+recorder.save("my_model", hints={
+    "vocab_size": 50257,
+    "hidden_dim": 768,
+    "context_length": 1024
+})
+```
+
+The codegen will prioritize these hints when generating the `Config` struct and mapping layer dimensions.
+
 ## Rust Verification API
 
 ```rust
@@ -271,15 +285,21 @@ Eliminate manual test writing by generating the full Rust test harness:
 - **Auto-Test CLI:** `pycandle gen-test` to generate `tests/parity.rs` automatically.
 - **Data-Driven Harness:** The test will automatically load the input/output tensors from the recorded trace and run the verification loop.
 
-### 🧩 Symbolic Ambiguity Hints
-**Status:** In Progress 🛠️
+### 📐 Symbolic Ambiguity Hints
+**Status:** Complete ✅
 
 Refining the symbolic propagator for complex models:
 - **Hint System:** Allow users to provide a `hints.json` to resolve ambiguous dimensions (e.g., when `hidden_dim` and `context_length` are both 1024).
-- **Dynamic Sequence Support:** Improved handling of variable-length audio/text sequences in the generated Rust code.
+- **Manual Overrides:** Use the Python `recorder.save(..., hints={"vocab_size": 50000})` to guide the codegen when heuristics fail.
+
+### 🧩 Multi-Input & Complex Slicing
+**Status:** Complete ✅
+
+- **Multi-Input Support:** Models with multiple placeholders (e.g., TTS models) correctly generate `forward(&self, xs0: &Tensor, xs1: &Tensor, ...)` signatures.
+- **Robust Slicing:** Improved handling of complex `torch.fx` slicing nodes, mapping `operator.getitem` to Candle's `.i()` with support for multi-dimensional ranges (e.g., `x.i((.., ..-1))?`).
 
 ### 📉 Quantization Parity (GGUF/AWQ)
-**Status:** Planned
+**Status:** Complete ✅
 
 Extending the verification engine to quantized models:
 - **Quantization Drift Tracking:** Measure MSE drift introduced specifically by `Q4_0`, `Q8_0`, or `AWQ` compared to the `f32` Golden Record.

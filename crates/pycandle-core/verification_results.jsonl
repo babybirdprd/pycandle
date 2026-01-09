@@ -1,0 +1,17 @@
+{"name":"layer_perfect","mse":0.0,"max_diff":0.0,"cosine_sim":0.99999994,"passed":true,"heatmap":null}
+{"name":"layer_drift_small","mse":9.995374e-7,"max_diff":0.0010004044,"cosine_sim":1.0,"passed":true,"heatmap":null}
+{"name":"layer_drift_large","mse":0.010000712,"max_diff":0.1000061,"cosine_sim":1.0,"passed":false,"heatmap":null}
+{"name":"layer_perfect","mse":0.0,"max_diff":0.0,"cosine_sim":0.99999994,"passed":true,"heatmap":null}
+{"name":"layer_drift_small","mse":9.995374e-7,"max_diff":0.0010004044,"cosine_sim":1.0,"passed":true,"heatmap":null}
+{"name":"layer_drift_large","mse":0.010000712,"max_diff":0.1000061,"cosine_sim":1.0,"passed":false,"heatmap":null}
+{"name":"layer_perfect","mse":0.0,"max_diff":0.0,"cosine_sim":0.99999994,"passed":true,"heatmap":null}
+{"name":"layer_drift_small","mse":9.995374e-7,"max_diff":0.0010004044,"cosine_sim":1.0,"passed":true,"heatmap":null}
+{"name":"layer_drift_large","mse":0.010000712,"max_diff":0.1000061,"cosine_sim":1.0,"passed":false,"heatmap":null}
+{"name":"node_linear","mse":0.44827208,"max_diff":1.1747879,"cosine_sim":0.0,"passed":false,"heatmap":null}
+{"name":"node_linear","mse":0.44827208,"max_diff":1.1747879,"cosine_sim":0.0,"passed":false,"heatmap":null}
+{"name":"node_linear","mse":0.0,"max_diff":0.0,"cosine_sim":0.99999994,"passed":true,"heatmap":null}
+{"name":"node_relu","mse":0.0,"max_diff":0.0,"cosine_sim":1.0000001,"passed":true,"heatmap":null}
+{"name":"node_relu","mse":0.0,"max_diff":0.0,"cosine_sim":1.0000001,"passed":true,"heatmap":null}
+{"name":"node_linear","mse":0.0,"max_diff":0.0,"cosine_sim":0.99999994,"passed":true,"heatmap":null}
+{"name":"node_relu","mse":0.0,"max_diff":0.0,"cosine_sim":1.0000001,"passed":true,"heatmap":null}
+{"name":"node_relu","mse":0.0,"max_diff":0.0,"cosine_sim":1.0000001,"passed":true,"heatmap":null}

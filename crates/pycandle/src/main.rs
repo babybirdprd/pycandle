@@ -62,6 +62,10 @@ enum Commands {
         /// Analyze without generating code
         #[arg(long)]
         analyze_only: bool,
+
+        /// Generate stateful code with KV-caching support
+        #[arg(long)]
+        stateful: bool,
     },
     /// Extract and manage TODO markers in generated code
     Todos {
@@ -105,8 +109,26 @@ enum Commands {
         #[arg(long, default_value = "MyModel")]
         model: String,
 
+        /// Path to the manifest JSON file
+        #[arg(short, long)]
+        manifest: PathBuf,
+
         /// Output path for the generated test file
         #[arg(short, long, default_value = "tests/parity.rs")]
+        out: PathBuf,
+    },
+    /// Convert ONNX model to PyCandle manifest
+    OnnxConvert {
+        /// Path to the ONNX model file
+        #[arg(short = 'i', long)]
+        onnx: PathBuf,
+
+        /// Project name
+        #[arg(short, long)]
+        name: String,
+
+        /// Output directory for the manifest
+        #[arg(short, long, default_value = "pycandle_trace")]
         out: PathBuf,
     },
 }
@@ -177,6 +199,7 @@ fn main() -> Result<()> {
             out: out_path,
             model,
             analyze_only,
+            stateful,
         } => {
             // Find manifests: if directory, glob *.json, else use file
             let manifest_files = if start_path.is_dir() {
@@ -233,7 +256,8 @@ fn main() -> Result<()> {
                     })
                     .collect::<Result<_>>()?;
 
-                let mut generator = Codegen::new(layers, full_manifest.symbolic_hints);
+                let mut generator =
+                    Codegen::new(layers, full_manifest.symbolic_hints).with_stateful(stateful);
                 if let Some(nodes) = full_manifest.graph_nodes {
                     generator = generator.with_graph(nodes);
                 }
@@ -426,9 +450,13 @@ fn main() -> Result<()> {
         Commands::Init { name } => {
             init::run_init(name)?;
         }
-        Commands::GenTest { model, out } => {
+        Commands::GenTest {
+            model,
+            manifest,
+            out,
+        } => {
             println!("🧪 Generating test harness for model '{}'...", model);
-            let generator = test_gen::TestGenerator::new(model);
+            let generator = test_gen::TestGenerator::new(model, manifest)?;
             let code = generator.generate_test_file();
 
             if let Some(parent) = out.parent() {
@@ -440,6 +468,36 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Failed to write test file to {:?}", out))?;
 
             println!("✅ Test generated at {:?}", out);
+        }
+        Commands::OnnxConvert { onnx, name, out } => {
+            println!(
+                "📦 Converting ONNX model '{:?}' to PyCandle manifest...",
+                onnx
+            );
+
+            let status = Command::new("uv")
+                .arg("run")
+                .arg("--project")
+                .arg("py")
+                .env("PYTHONPATH", "py")
+                .arg("python")
+                .arg("py/onnx_to_fx.py")
+                .arg("--onnx")
+                .arg(&onnx)
+                .arg("--name")
+                .arg(&name)
+                .arg("--out")
+                .arg(&out)
+                .spawn()
+                .context("Failed to spawn uv run")?
+                .wait()
+                .context("Failed to wait for python process")?;
+
+            if status.success() {
+                println!("✅ Conversion complete. Manifest saved in {:?}", out);
+            } else {
+                eprintln!("❌ Conversion failed.");
+            }
         }
     }
 

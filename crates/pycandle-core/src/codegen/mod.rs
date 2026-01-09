@@ -65,10 +65,11 @@ pub struct SymbolicConfig {
 
 /// Code generator that converts manifests to Rust code
 pub struct Codegen {
-    manifest: HashMap<String, LayerMeta>,
-    graph_nodes: Option<Vec<GraphNode>>,
+    pub manifest: HashMap<String, LayerMeta>,
+    pub hints: Option<HashMap<String, usize>>,
+    pub graph_nodes: Vec<GraphNode>,
+    pub stateful: bool,
     config: SymbolicConfig,
-    hints: HashMap<String, usize>,
 }
 
 impl Codegen {
@@ -78,55 +79,63 @@ impl Codegen {
     ) -> Self {
         let mut slf = Self {
             manifest,
-            graph_nodes: None,
+            hints: hints.clone(),
+            graph_nodes: Vec::new(),
+            stateful: false,
             config: SymbolicConfig::default(),
-            hints: hints.unwrap_or_default(),
         };
         slf.config = slf.extract_symbolic_config();
         slf
     }
 
     pub fn with_graph(mut self, graph_nodes: Vec<GraphNode>) -> Self {
-        self.graph_nodes = Some(graph_nodes);
+        self.graph_nodes = graph_nodes;
+        self
+    }
+
+    pub fn with_stateful(mut self, stateful: bool) -> Self {
+        self.stateful = stateful;
         self
     }
 
     pub fn extract_symbolic_config(&self) -> SymbolicConfig {
-        let mut dims = self.hints.clone();
+        let mut dims = self.hints.clone().unwrap_or_default();
 
         for meta in self.manifest.values() {
             // GPT2 specific extraction
             if let Some(v) = meta.config.get("vocab_size").and_then(|v| v.as_u64()) {
-                dims.insert("vocab_size".to_string(), v as usize);
+                dims.entry("vocab_size".to_string()).or_insert(v as usize);
             }
             if let Some(v) = meta.config.get("n_embd").and_then(|v| v.as_u64()) {
-                dims.insert("hidden_dim".to_string(), v as usize);
+                dims.entry("hidden_dim".to_string()).or_insert(v as usize);
             }
             if let Some(v) = meta.config.get("n_head").and_then(|v| v.as_u64()) {
-                dims.insert("n_head".to_string(), v as usize);
+                dims.entry("n_head".to_string()).or_insert(v as usize);
             }
             if let Some(v) = meta.config.get("n_layer").and_then(|v| v.as_u64()) {
-                dims.insert("n_layers".to_string(), v as usize);
+                dims.entry("n_layers".to_string()).or_insert(v as usize);
             }
             if let Some(v) = meta.config.get("n_positions").and_then(|v| v.as_u64()) {
-                dims.insert("context_length".to_string(), v as usize);
+                dims.entry("context_length".to_string())
+                    .or_insert(v as usize);
             }
 
             // Generic extraction
             match meta.module_type.as_str() {
                 "Embedding" => {
                     if let Some(n) = meta.config.get("num_embeddings").and_then(|v| v.as_u64()) {
-                        dims.insert("vocab_size".to_string(), n as usize);
+                        dims.entry("vocab_size".to_string()).or_insert(n as usize);
                     }
                     if let Some(d) = meta.config.get("embedding_dim").and_then(|v| v.as_u64()) {
-                        dims.insert("hidden_dim".to_string(), d as usize);
+                        dims.entry("hidden_dim".to_string()).or_insert(d as usize);
                     }
                 }
                 "Linear" | "LoRACompatibleLinear" => {
-                    // If out_features is high (like 50000+), maybe it's vocab_size?
+                    // If out_features is high (like 30000+), it's likely a vocab_size (lm_head)
                     if let Some(out_f) = meta.config.get("out_features").and_then(|v| v.as_u64()) {
-                        if out_f > 30000 && !dims.contains_key("vocab_size") {
-                            dims.insert("vocab_size".to_string(), out_f as usize);
+                        if out_f > 30000 {
+                            dims.entry("vocab_size".to_string())
+                                .or_insert(out_f as usize);
                         }
                     }
                 }
@@ -262,25 +271,26 @@ impl Codegen {
 
     pub fn generate_model_rs(&self, model_name: &str) -> String {
         let mut code = String::new();
-        code.push_str("use candle_core::{Tensor, Result, Device, Shape};\n");
-        code.push_str(
-            "use candle_nn::{Linear, Conv1d, LayerNorm, Embedding, VarBuilder, Module};\n",
-        );
-        code.push_str("use pycandle_core::{PyChecker, py_check, Dropout, Transpose, Mish, CausalConv1d, SiLU, ReLU, GELU, Sigmoid, Tanh, ELU, LeakyReLU, Snake, BatchNorm1d, BatchNorm2d, LSTM};\n");
+        code.push_str("use candle_core::{Result, Tensor, IndexOp, Shape};\n");
+        code.push_str("use candle_nn::{Module, VarBuilder};\n");
+        code.push_str("use pycandle_core::{PyChecker, py_check, VerificationMode, layers::*};\n\n");
 
-        // Add gpt2 import if GPT2 types are present
-        if self.has_gpt2_types() {
-            code.push_str("use pycandle_core::gpt2;\n");
+        if self.stateful {
+            code.push_str(
+                r#"#[derive(Debug, Clone)]
+pub struct KVCache {
+    pub k: Tensor,
+    pub v: Tensor,
+}
+
+"#,
+            );
         }
+
+        code.push_str(&self.generate_config_struct());
         code.push_str("\n");
-
-        if !self.config.dims.is_empty() {
-            code.push_str(&self.generate_config_struct());
-            code.push_str("\n\n");
-        }
-
         code.push_str(&self.generate_struct(model_name));
-        code.push_str("\n\n");
+        code.push_str("\n");
         code.push_str(&self.generate_impl(model_name));
 
         code
@@ -304,24 +314,30 @@ impl Codegen {
             .any(|meta| gpt2::is_gpt2_type(&meta.module_type))
     }
 
-    fn generate_struct(&self, model_name: &str) -> String {
-        let mut lines = vec![format!("pub struct {} {{", model_name)];
+    pub fn generate_struct(&self, model_name: &str) -> String {
+        let mut code = format!("pub struct {} {{\n", model_name);
 
-        let mut layers: Vec<_> = self.manifest.iter().collect();
-        layers.sort_by_key(|(k, _)| *k);
+        let mut sorted_keys: Vec<_> = self.manifest.keys().collect();
+        sorted_keys.sort();
 
-        for (layer_name, meta) in layers {
-            if !meta.is_leaf {
-                continue;
+        for name in sorted_keys {
+            let meta = &self.manifest[name];
+            if meta.is_leaf {
+                let rust_type = self.map_type(&meta.module_type);
+                code.push_str(&format!(
+                    "    pub {}: {},\n",
+                    name.replace(".", "_"),
+                    rust_type
+                ));
             }
-            let clean_name = layer_name.replace(".", "_");
-            let candle_type = self.map_type(&meta.module_type);
-            lines.push(format!("    pub {}: {},", clean_name, candle_type));
         }
 
-        lines.push("    pub checker: Option<PyChecker>,".to_string());
-        lines.push("}".to_string());
-        lines.join("\n")
+        code.push_str("    pub checker: Option<PyChecker>,\n");
+        if self.stateful {
+            code.push_str("    pub cache: std::cell::RefCell<Vec<Option<KVCache>>>,\n");
+        }
+        code.push_str("}\n");
+        code
     }
 
     fn map_type(&self, py_type: &str) -> String {
@@ -332,10 +348,10 @@ impl Codegen {
 
         // Core types
         match py_type {
-            "Linear" => "Linear".to_string(),
-            "Conv1d" => "Conv1d".to_string(),
-            "LayerNorm" => "LayerNorm".to_string(),
-            "Embedding" => "Embedding".to_string(),
+            "Linear" => "candle_nn::Linear".to_string(),
+            "Conv1d" => "candle_nn::Conv1d".to_string(),
+            "LayerNorm" => "candle_nn::LayerNorm".to_string(),
+            "Embedding" => "candle_nn::Embedding".to_string(),
             // Activations
             "ReLU" => "ReLU".to_string(),
             "GELU" => "GELU".to_string(),
@@ -360,74 +376,78 @@ impl Codegen {
         }
     }
 
-    fn generate_impl(&self, model_name: &str) -> String {
+    pub fn generate_impl(&self, model_name: &str) -> String {
         let mut code = format!("impl {} {{\n", model_name);
 
-        let load_args = if self.config.dims.is_empty() {
-            "vb: VarBuilder, checker: Option<PyChecker>".to_string()
-        } else {
-            "cfg: Config, vb: VarBuilder, checker: Option<PyChecker>".to_string()
-        };
-
+        // Load method
         code.push_str(&format!(
-            "    pub fn load({}) -> Result<Self> {{\n",
-            load_args
+            "    pub fn load(_cfg: Config, vb: VarBuilder, checker: Option<PyChecker>) -> Result<Self> {{\n"
         ));
 
-        let mut layers: Vec<_> = self.manifest.iter().collect();
-        layers.sort_by_key(|(k, _)| *k);
+        let mut sorted_keys: Vec<_> = self.manifest.keys().collect();
+        sorted_keys.sort();
 
-        for (layer_name, meta) in &layers {
-            if !meta.is_leaf {
-                continue;
+        for name in &sorted_keys {
+            let meta = self.manifest.get(*name).unwrap();
+            if meta.is_leaf {
+                let field = name.replace(".", "_");
+                let init = self.generate_init(name, meta);
+                code.push_str(&format!("        let {} = {};\n", field, init));
             }
-            let clean_name = layer_name.replace(".", "_");
-            let init_call = self.generate_init(layer_name, meta);
-            code.push_str(&format!("        let {} = {};\n", clean_name, init_call));
         }
 
-        code.push_str("\n        Ok(Self {\n");
-        for (layer_name, meta) in &layers {
-            if !meta.is_leaf {
-                continue;
+        let mut fields = vec![];
+        for name in &sorted_keys {
+            if self.manifest.get(*name).unwrap().is_leaf {
+                fields.push(name.replace(".", "_"));
             }
-            code.push_str(&format!("            {},\n", layer_name.replace(".", "_")));
         }
-        code.push_str("            checker,\n");
-        code.push_str("        })\n");
+        fields.push("checker".to_string());
+
+        code.push_str(&format!("        Ok(Self {{ {}", fields.join(", ")));
+        if self.stateful {
+            code.push_str(", cache: std::cell::RefCell::new(Vec::new())");
+        }
+        code.push_str(" })\n");
         code.push_str("    }\n\n");
 
-        if let Some(nodes) = &self.graph_nodes {
-            code.push_str(&self.generate_forward_dag(nodes));
-        } else {
-            // Forward method
-            let ret_type = self.get_forward_return_type();
-            code.push_str(&format!(
-                "    pub fn forward(&self, xs: &Tensor) -> {} {{\n",
-                ret_type
-            ));
+        // Forward methods
+        if self.graph_nodes.is_empty() {
+            // Sequential fallback
+            code.push_str("    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {\n");
+            if self.stateful {
+                code.push_str(
+                    "        self.forward_with_cache(xs, &mut self.cache.borrow_mut())\n",
+                );
+                code.push_str("    }\n\n");
+                code.push_str("    pub fn forward_with_cache(&self, xs: &Tensor, cache: &mut Vec<Option<KVCache>>) -> Result<Tensor> {\n");
+            }
             code.push_str("        let mut x = xs.clone();\n");
 
-            for (layer_name, meta) in &layers {
+            for name in &sorted_keys {
+                let meta = self.manifest.get(*name).unwrap();
                 if !meta.is_leaf {
                     continue;
                 }
-                let clean_name = layer_name.replace(".", "_");
+                let clean_name = name.replace(".", "_");
                 let forward_call = if self.map_type(&meta.module_type) == "LSTM" {
                     format!("self.{}.forward(&x)?.0", clean_name)
                 } else {
                     format!("self.{}.forward(&x)?", clean_name)
                 };
-                code.push_str(&format!("\n        // Layer: {}\n", layer_name));
+                code.push_str(&format!("\n        // Layer: {}\n", name));
                 code.push_str(&format!("        x = {};\n", forward_call));
                 code.push_str(&format!(
                     "        py_check!(self.checker, \"{}\", &x);\n",
-                    layer_name
+                    name
                 ));
             }
 
             code.push_str("\n        Ok(x)\n");
             code.push_str("    }\n");
+        } else {
+            // DAG / torch.fx based forward
+            code.push_str(&self.generate_forward_dag(&self.graph_nodes));
         }
         code.push_str("}\n");
 
@@ -435,23 +455,48 @@ impl Codegen {
     }
 
     fn generate_forward_dag(&self, nodes: &[GraphNode]) -> String {
+        let mut placeholders = Vec::new();
+        for node in nodes {
+            if node.op == "placeholder" {
+                placeholders.push(node.name.clone());
+            }
+        }
+
         let mut code = String::new();
         let ret_type = self.get_forward_return_type();
+
+        let inputs = if placeholders.len() <= 1 {
+            "xs: &Tensor".to_string()
+        } else {
+            placeholders
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("xs{}: &Tensor", i))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
         code.push_str(&format!(
-            "    pub fn forward(&self, xs: &Tensor) -> {} {{\n",
-            ret_type
+            "    pub fn forward(&self, {}) -> {} {{\n",
+            inputs, ret_type
         ));
 
         // Map python placeholder names to Rust input variables
         let mut var_map = HashMap::new();
         let mut node_types = HashMap::new();
 
+        let mut placeholder_idx = 0;
         for node in nodes {
             match node.op.as_str() {
                 "placeholder" => {
-                    // Assume first placeholder is xs
-                    var_map.insert(node.name.clone(), "xs".to_string());
+                    let var_name = if placeholders.len() <= 1 {
+                        "xs".to_string()
+                    } else {
+                        format!("xs{}", placeholder_idx)
+                    };
+                    var_map.insert(node.name.clone(), var_name);
                     node_types.insert(node.name.clone(), ReturnType::Tensor);
+                    placeholder_idx += 1;
                 }
                 "call_module" => {
                     let clean_name = node.target.replace(".", "_");
@@ -461,10 +506,14 @@ impl Codegen {
                             serde_json::Value::String(s) => {
                                 var_map.get(s).cloned().unwrap_or(s.clone())
                             }
-                            _ => "xs".to_string(),
+                            _ => {
+                                let first_p = placeholders.get(0).and_then(|p| var_map.get(p));
+                                first_p.cloned().unwrap_or("xs".to_string())
+                            }
                         }
                     } else {
-                        "xs".to_string()
+                        let first_p = placeholders.get(0).and_then(|p| var_map.get(p));
+                        first_p.cloned().unwrap_or("xs".to_string())
                     };
 
                     let module_type = node.module_type.clone().unwrap_or_default();
@@ -557,10 +606,14 @@ impl Codegen {
                                     .collect();
                                 format!("({})", items.join(", "))
                             }
-                            _ => "xs".to_string(),
+                            _ => {
+                                let first_p = placeholders.get(0).and_then(|p| var_map.get(p));
+                                first_p.cloned().unwrap_or("xs".to_string())
+                            }
                         }
                     } else {
-                        "xs".to_string()
+                        let first_p = placeholders.get(0).and_then(|p| var_map.get(p));
+                        first_p.cloned().unwrap_or("xs".to_string())
                     };
                     code.push_str(&format!("        Ok({})\n", out_var));
                 }
@@ -625,8 +678,16 @@ impl Codegen {
         match target {
             "torch.cat" | "cat" => {
                 let dim = args.get(1).map(|s| s.as_str()).unwrap_or("1");
+                let mut tensors = args[0].clone();
+                if tensors.starts_with("&[") {
+                    // Convert &[x, y] to &[&x, &y] for Candle's cat
+                    let content = &tensors[2..tensors.len() - 1];
+                    let items: Vec<String> =
+                        content.split(", ").map(|s| format!("&{}", s)).collect();
+                    tensors = format!("&[{}]", items.join(", "));
+                }
                 (
-                    format!("Tensor::cat({}, {})?", args[0], dim),
+                    format!("Tensor::cat({}, {})?", tensors, dim),
                     ReturnType::Tensor,
                 )
             }
@@ -742,35 +803,20 @@ impl Codegen {
                             if cleaned.starts_with("&[") {
                                 cleaned = cleaned[2..cleaned.len() - 1].to_string();
                             }
-                            cleaned = cleaned.replace("slice(None, None, None)", "..");
-                            // Handle slice(None, stop, None) -> ..stop
-                            while let Some(pos) = cleaned.find("slice(None, ") {
-                                if let Some(end_pos) = cleaned[pos..].find(", None)") {
-                                    let stop = &cleaned[pos + 12..pos + end_pos];
-                                    let stop_trimmed = stop.trim();
-                                    cleaned.replace_range(
-                                        pos..pos + end_pos + 7,
-                                        &format!("..{}", stop_trimmed),
-                                    );
-                                } else {
-                                    break;
-                                }
-                            }
-                            // Handle slice(start, None, None) -> start..
-                            while let Some(pos) = cleaned.find("slice(") {
-                                if let Some(end_pos) = cleaned[pos..].find(", None, None)") {
-                                    let start = &cleaned[pos + 6..pos + end_pos];
-                                    let start_trimmed = start.trim();
-                                    cleaned.replace_range(
-                                        pos..pos + end_pos + 13,
-                                        &format!("{}..", start_trimmed),
-                                    );
-                                } else {
-                                    break;
-                                }
-                            }
-                            cleaned = cleaned.replace("None", "..");
-                            (format!("{}.i(({}))?", args[0], cleaned), ReturnType::Tensor)
+
+                            let items: Vec<String> = cleaned
+                                .split(",")
+                                .enumerate()
+                                .map(|(i, s)| self.parse_slice_item(s.trim(), &args[0], i))
+                                .collect();
+
+                            let final_idx = if items.len() == 1 {
+                                items[0].clone()
+                            } else {
+                                format!("({})", items.join(", "))
+                            };
+
+                            (format!("{}.i({})?", args[0], final_idx), ReturnType::Tensor)
                         } else {
                             (format!("{}.get({})?", args[0], args[1]), ReturnType::Tensor)
                         }
@@ -792,6 +838,61 @@ impl Codegen {
         }
     }
 
+    fn parse_slice_item(&self, item: &str, tensor_name: &str, dim_idx: usize) -> String {
+        if item == "None" {
+            return "..".to_string();
+        }
+
+        // Handle single negative index
+        if let Ok(val) = item.parse::<isize>() {
+            if val < 0 {
+                return format!("{}.dim({})? - {}", tensor_name, dim_idx, val.abs());
+            }
+            return item.to_string();
+        }
+
+        if !item.contains("slice(") {
+            return item.to_string();
+        }
+
+        // Parse slice(start, stop, step)
+        let content = item
+            .strip_prefix("slice(")
+            .and_then(|s| s.strip_suffix(")"))
+            .unwrap_or(item);
+        let parts: Vec<&str> = content.split(",").map(|s| s.trim()).collect();
+
+        let start_str = parts.get(0).copied().unwrap_or("None");
+        let stop_str = parts.get(1).copied().unwrap_or("None");
+
+        let start = if let Ok(val) = start_str.parse::<isize>() {
+            if val < 0 {
+                format!("{}.dim({})? - {}", tensor_name, dim_idx, val.abs())
+            } else {
+                start_str.to_string()
+            }
+        } else {
+            start_str.to_string()
+        };
+
+        let stop = if let Ok(val) = stop_str.parse::<isize>() {
+            if val < 0 {
+                format!("{}.dim({})? - {}", tensor_name, dim_idx, val.abs())
+            } else {
+                stop_str.to_string()
+            }
+        } else {
+            stop_str.to_string()
+        };
+
+        match (start.as_str(), stop.as_str()) {
+            ("None", "None") => "..".to_string(),
+            ("None", stop) => format!("..{}", stop),
+            (start, "None") => format!("{}..", start),
+            (start, stop) => format!("{}..{}", start, stop),
+        }
+    }
+
     fn map_fx_method(
         &self,
         method: &str,
@@ -800,7 +901,7 @@ impl Codegen {
         args: &[String],
         node_types: &HashMap<String, ReturnType>,
     ) -> (String, ReturnType) {
-        let src_type = node_types
+        let _src_type = node_types
             .get(self_var_name)
             .cloned()
             .unwrap_or(ReturnType::Tensor);
@@ -1104,8 +1205,8 @@ impl Codegen {
     }
 
     fn get_forward_return_type(&self) -> String {
-        if let Some(nodes) = &self.graph_nodes {
-            for node in nodes {
+        if !self.graph_nodes.is_empty() {
+            for node in &self.graph_nodes {
                 if node.op == "output" {
                     if let Some(arg0) = node.args.get(0) {
                         if let Some(arr) = arg0.as_array() {

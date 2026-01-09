@@ -11,11 +11,11 @@
 mod checker;
 pub mod codegen;
 pub mod gpt2;
-mod layers;
+pub mod layers;
 pub mod samplers;
 pub mod weights;
 
-pub use checker::{ComparisonResult, LayerMeta, PyChecker};
+pub use checker::{ComparisonResult, LayerMeta, PyChecker, VerificationMode};
 pub use layers::*;
 pub use samplers::*;
 pub use weights::{WeightExtractor, WeightMapper};

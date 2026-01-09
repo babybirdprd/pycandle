@@ -9,4 +9,7 @@ dependencies = [
     "packaging",
     "safetensors",
     "torch>=2.0.0",
+    "onnx",
+    "onnx2torch",
+    "onnxscript",
 ]

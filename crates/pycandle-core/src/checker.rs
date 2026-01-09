@@ -3,10 +3,18 @@
 use candle_core::{Device, Error, Result, Shape, Tensor};
 use colored::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+
+/// Mode for verification: Strict (panic on failure) or DriftTracking (record and continue)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VerificationMode {
+    Strict,
+    DriftTracking,
+}
 
 /// Metadata for a recorded layer
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -32,6 +40,7 @@ pub struct ComparisonResult {
 }
 
 /// PyChecker loads golden tensors and verifies Rust outputs against them
+#[derive(Clone)]
 pub struct PyChecker {
     pub name: String,
     golden_tensors: HashMap<String, Tensor>,
@@ -39,6 +48,8 @@ pub struct PyChecker {
     pub atol: f32,
     pub rtol: f32,
     pub device: Device,
+    pub mode: VerificationMode,
+    history: RefCell<Vec<ComparisonResult>>,
 }
 
 impl PyChecker {
@@ -52,8 +63,19 @@ impl PyChecker {
 
         let manifest_file = std::fs::read_to_string(&manifest_path)
             .map_err(|e| Error::Msg(format!("Failed to read manifest: {}", e)))?;
-        let manifest: HashMap<String, LayerMeta> = serde_json::from_str(&manifest_file)
+        let full_manifest: HashMap<String, serde_json::Value> = serde_json::from_str(&manifest_file)
             .map_err(|e| Error::Msg(format!("Failed to parse manifest: {}", e)))?;
+
+        let manifest: HashMap<String, LayerMeta> = full_manifest
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .map(|(k, v)| {
+                let meta: LayerMeta = serde_json::from_value(v).map_err(|e| {
+                    Error::Msg(format!("Failed to parse LayerMeta for {}: {}", k, e))
+                })?;
+                Ok((k, meta))
+            })
+            .collect::<Result<HashMap<String, LayerMeta>>>()?;
 
         Ok(Self {
             name: project_name.to_string(),
@@ -62,7 +84,15 @@ impl PyChecker {
             atol: 1e-4,
             rtol: 1e-4,
             device: device.clone(),
+            mode: VerificationMode::Strict,
+            history: RefCell::new(Vec::new()),
         })
+    }
+
+    /// Set verification mode
+    pub fn with_mode(mut self, mode: VerificationMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// Verify a tensor against the golden record for a layer
@@ -93,23 +123,61 @@ impl PyChecker {
             // Compute heatmap for dashboard
             result.heatmap = self.compute_heatmap(actual, expected);
 
-            self.report_failure(layer_name, &result, actual, expected);
-            self.log_result(&result);
-            return Err(Error::Msg(format!(
-                "Numerical parity failed for {}",
-                layer_name
-            )));
+            // In Strict mode, we fail immediately
+            if self.mode == VerificationMode::Strict {
+                self.report_failure(layer_name, &result, actual, expected);
+                self.log_result(&result);
+                return Err(Error::Msg(format!(
+                    "Numerical parity failed for {}",
+                    layer_name
+                )));
+            } else {
+                // In DriftTracking mode, we warn but continue
+                println!(
+                    "{} Layer '{}' drifted. (MSE: {:.2e})",
+                    "⚠".yellow(),
+                    layer_name.yellow(),
+                    result.mse
+                );
+            }
+        } else {
+            println!(
+                "{} Layer '{}' passed. (MSE: {:.2e}, CosSim: {:.4})",
+                "✔".green(),
+                layer_name.yellow(),
+                result.mse,
+                result.cosine_sim
+            );
         }
 
-        println!(
-            "{} Layer '{}' passed. (MSE: {:.2e}, CosSim: {:.4})",
-            "✔".green(),
-            layer_name.yellow(),
-            result.mse,
-            result.cosine_sim
-        );
         self.log_result(&result);
+        self.history.borrow_mut().push(result.clone());
         Ok(result)
+    }
+
+    /// Print a report of the most sensitive layers (highest drift)
+    pub fn print_drift_report(&self) {
+        let history = self.history.borrow();
+        if history.is_empty() {
+            return;
+        }
+
+        println!("\n{}", "📉 QUANTIZATION DRIFT REPORT".blue().bold());
+        println!("{:<40} | {:<12} | {:<12}", "Layer", "MSE", "Status");
+        println!("{}", "-".repeat(70));
+
+        let mut sorted_history = history.clone();
+        sorted_history.sort_by(|a, b| b.mse.partial_cmp(&a.mse).unwrap());
+
+        for res in sorted_history.iter().take(20) {
+            let status = if res.mse > self.atol {
+                "DRIFT".red()
+            } else {
+                "OK".green()
+            };
+            println!("{:<40} | {:.2e}   | {}", res.name, res.mse, status);
+        }
+        println!("\n");
     }
 
     fn log_result(&self, result: &ComparisonResult) {
