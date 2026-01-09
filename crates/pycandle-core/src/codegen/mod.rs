@@ -18,6 +18,7 @@ pub enum ReturnType {
     Tuple,
     Vec,
     Primitive,
+    FInfo, // For torch.finfo objects
 }
 
 // ============================================================================
@@ -821,6 +822,12 @@ pub struct KVCache {
                         ReturnType::Primitive,
                     );
                 }
+                ReturnType::FInfo => {
+                    return (
+                        format!("todo!(/* FInfo indexing on {} */)", args[0]),
+                        ReturnType::FInfo,
+                    );
+                }
             }
         }
 
@@ -971,6 +978,45 @@ pub struct KVCache {
                     ),
                     ReturnType::Tensor,
                 )
+            }
+            // FEATURE: builtins.getattr
+            "builtins.getattr" => {
+                let obj = &args[0];
+                let attr = args[1].trim_matches('"');
+
+                // Check if obj is an FInfo object
+                let obj_type = var_map
+                    .get(obj)
+                    .and_then(|v| node_types.get(v))
+                    .cloned()
+                    .unwrap_or(ReturnType::Tensor);
+                if matches!(obj_type, ReturnType::FInfo) {
+                    match attr {
+                        "min" => return ("f32::MIN".to_string(), ReturnType::Primitive),
+                        "max" => return ("f32::MAX".to_string(), ReturnType::Primitive),
+                        _ => {
+                            return (
+                                format!("todo!(/* FInfo attr {} */)", attr),
+                                ReturnType::Primitive,
+                            );
+                        }
+                    }
+                }
+
+                match attr {
+                    "device" => (format!("{}.device()", obj), ReturnType::Primitive),
+                    "dtype" => (format!("{}.dtype()", obj), ReturnType::Primitive),
+                    "shape" => (format!("{}.dims().to_vec()", obj), ReturnType::Vec),
+                    _ => (
+                        format!("todo!(/* getattr {} on {} */)", attr, obj),
+                        ReturnType::Primitive,
+                    ),
+                }
+            }
+            // FEATURE: torch.finfo
+            "torch.finfo" => {
+                // We return a dummy because the value is only used for getattr
+                ("()".to_string(), ReturnType::FInfo)
             }
             // FEATURE: Functional Tensor Creation
             "torch.ones" | "ones" => {
@@ -1165,6 +1211,10 @@ pub struct KVCache {
                         format!("todo!(/* primitive indexing on {} */)", args[0]),
                         ReturnType::Primitive,
                     ),
+                    ReturnType::FInfo => (
+                        format!("todo!(/* FInfo indexing on {} */)", args[0]),
+                        ReturnType::Primitive,
+                    ),
                 }
             }
             _ => {
@@ -1287,6 +1337,47 @@ pub struct KVCache {
                 format!("{}.permute({})?", self_var, args[0]),
                 ReturnType::Tensor,
             ),
+            // Casting / Device Movement
+            "to" => {
+                // .to(dtype) or .to(device)
+                if args.len() == 1 {
+                    if args[0].contains("DType") {
+                        (
+                            format!("{}.to_dtype({})?", self_var, args[0]),
+                            ReturnType::Tensor,
+                        )
+                    } else if args[0].contains("Device") {
+                        (
+                            format!("{}.to_device(&{})?", self_var, args[0]),
+                            ReturnType::Tensor,
+                        )
+                    } else {
+                        (
+                            format!("{}.to_dtype({})?", self_var, args[0]),
+                            ReturnType::Tensor,
+                        )
+                    }
+                } else {
+                    (
+                        format!("{}.to_dtype({})?", self_var, args[0]),
+                        ReturnType::Tensor,
+                    )
+                }
+            }
+            // Expansion
+            "expand" => {
+                // x.expand(sizes) -> x.broadcast_as(sizes)
+                // args might be a list of dims or a single shape logic
+                let shape_arg = if args.len() == 1 {
+                    args[0].clone()
+                } else {
+                    format!("({})", args.join(", "))
+                };
+                (
+                    format!("{}.broadcast_as({})?", self_var, shape_arg),
+                    ReturnType::Tensor,
+                )
+            }
             "unsqueeze" => (
                 format!("{}.unsqueeze({})?", self_var, args[0]),
                 ReturnType::Tensor,
