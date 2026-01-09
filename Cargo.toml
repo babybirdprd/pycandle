@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pycandle", "crates/pycandle-core", "crates/pycandle-audio", "dx_simulation"]
+members = ["crates/pycandle", "crates/pycandle-core", "crates/pycandle-audio"]
 resolver = "2"
 
 [workspace.package]

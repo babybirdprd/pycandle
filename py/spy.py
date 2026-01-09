@@ -14,6 +14,7 @@ class LayerMeta:
     input_shapes: List[List[int]]
     output_shapes: List[List[int]]
     parameters: List[str]
+    buffers: List[str]
     is_leaf: bool
     config: Dict[str, Any]
 
@@ -117,6 +118,24 @@ class GoldenRecorder:
             cfg['n_layer'] = module.config.n_layer  # n_layers
             cfg['resid_pdrop'] = module.config.resid_pdrop  # drop_rate
         
+        # --- Universal Fallback ---
+        # Capture all scalar/list attributes to support generic loading
+        # This allows us to handle layers we haven't explicitly mapped yet
+        base_attrs = dir(torch.nn.Module())
+        for k in dir(module):
+            if k.startswith('_') or k in base_attrs: continue
+            try:
+                v = getattr(module, k)
+                if isinstance(v, (int, float, bool, str)):
+                    if k not in cfg:
+                        cfg[k] = v
+                elif isinstance(v, (tuple, list)):
+                    if all(isinstance(x, (int, float, bool, str)) for x in v):
+                         if k not in cfg:
+                            cfg[k] = v
+            except:
+                pass
+        
         return cfg
 
     def _tensor_to_cpu(self, t: Any) -> Optional[torch.Tensor]:
@@ -169,12 +188,13 @@ class GoldenRecorder:
                 input_shapes=self._extract_shapes(inp),
                 output_shapes=self._extract_shapes(out),
                 parameters=[n for n, _ in m.named_parameters(recurse=False)],
+                buffers=[n for n, _ in m.named_buffers(recurse=False)],
                 is_leaf=len(list(m.children())) == 0,
                 config=self._get_module_config(m)
             )
         return hook
 
-    def record(self, model: nn.Module, *args, trace_fx: bool = False, **kwargs):
+    def record(self, model: nn.Module, *args, trace_fx: bool = False, fx_concrete_args: Optional[Dict[str, Any]] = None, **kwargs):
         model.eval()
         
         # Record model inputs
@@ -196,16 +216,33 @@ class GoldenRecorder:
                 h.remove()
         
         if trace_fx:
-            self.trace_fx(model, *args, **kwargs)
+            self.trace_fx(model, concrete_args=fx_concrete_args, *args, **kwargs)
             
         return output
 
-    def trace_fx(self, model: nn.Module, *example_inputs):
+    def trace_fx(self, model: nn.Module, *example_inputs, concrete_args=None, **kwargs):
         """Use torch.fx to capture the computation graph."""
         import torch.fx as fx
         
-        # We use a symbolic trace to capture the graph
-        traced = fx.symbolic_trace(model)
+        # Try to use transformers.utils.fx if available for HF models
+        # This handles control flow and other HF-specific quirks better than vanilla fx
+        try:
+            from transformers.utils.fx import symbolic_trace as hf_symbolic_trace
+            # Check if it's a transformers model (heuristic)
+            is_hf = any(c.__module__.startswith("transformers") for c in model.__class__.__mro__)
+            if is_hf:
+                print("🕵️ Using transformers.utils.fx.symbolic_trace for robustness...")
+                # HF tracer requires input_names usually, but let's try basic first
+                # Note: HF tracer might expect 'input_names' kwarg if we want to be safe, 
+                # but let's see if it works with just concrete_args.
+                traced = hf_symbolic_trace(model, input_names=["input_ids"], disable_check=True)
+            else:
+                traced = fx.symbolic_trace(model, concrete_args=concrete_args)
+        except ImportError:
+            traced = fx.symbolic_trace(model, concrete_args=concrete_args)
+        except Exception as e:
+            print(f"⚠️ transformers trace failed ({e}), falling back to torch.fx...")
+            traced = fx.symbolic_trace(model, concrete_args=concrete_args)
         
         def serialize_arg(arg):
             if isinstance(arg, (list, tuple)):
@@ -214,13 +251,23 @@ class GoldenRecorder:
                 return arg.name
             return str(arg)
 
+        def serialize_target(target):
+            if isinstance(target, str):
+                return target
+            if hasattr(target, "__module__") and hasattr(target, "__name__"):
+                 # e.g. torch.arange, operator.getitem
+                 return f"{target.__module__}.{target.__name__}"
+            if hasattr(target, "__name__"):
+                return target.__name__
+            return str(target)
+
         graph_nodes = []
         for node in traced.graph.nodes:
             # We want to map these nodes to the modules or functions
             node_info = {
                 "name": node.name,
                 "op": node.op,
-                "target": str(node.target),
+                "target": serialize_target(node.target),
                 "args": [serialize_arg(arg) for arg in node.args],
             }
             

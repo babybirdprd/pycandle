@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+pycandle_spy.egg-info/PKG-INFO
+pycandle_spy.egg-info/SOURCES.txt
+pycandle_spy.egg-info/dependency_links.txt
+pycandle_spy.egg-info/requires.txt
+pycandle_spy.egg-info/top_level.txt

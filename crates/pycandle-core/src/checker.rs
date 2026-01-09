@@ -24,6 +24,7 @@ pub struct LayerMeta {
     pub input_shapes: Vec<Vec<usize>>,
     pub output_shapes: Vec<Vec<usize>>,
     pub parameters: Vec<String>,
+    pub buffers: Vec<String>,
     pub is_leaf: bool,
     pub config: serde_json::Value,
 }
@@ -63,8 +64,9 @@ impl PyChecker {
 
         let manifest_file = std::fs::read_to_string(&manifest_path)
             .map_err(|e| Error::Msg(format!("Failed to read manifest: {}", e)))?;
-        let full_manifest: HashMap<String, serde_json::Value> = serde_json::from_str(&manifest_file)
-            .map_err(|e| Error::Msg(format!("Failed to parse manifest: {}", e)))?;
+        let full_manifest: HashMap<String, serde_json::Value> =
+            serde_json::from_str(&manifest_file)
+                .map_err(|e| Error::Msg(format!("Failed to parse manifest: {}", e)))?;
 
         let manifest: HashMap<String, LayerMeta> = full_manifest
             .into_iter()

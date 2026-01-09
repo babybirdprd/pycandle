@@ -12,6 +12,7 @@ mod checker;
 pub mod codegen;
 pub mod gpt2;
 pub mod layers;
+pub mod ops;
 pub mod samplers;
 pub mod weights;
 

@@ -17,6 +17,7 @@ pub enum ReturnType {
     Tensor,
     Tuple,
     Vec,
+    Primitive,
 }
 
 // ============================================================================
@@ -55,6 +56,8 @@ pub struct GraphNode {
     pub op: String,
     pub target: String,
     pub args: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub kwargs: HashMap<String, serde_json::Value>,
     pub module_type: Option<String>,
 }
 
@@ -616,11 +619,19 @@ pub struct KVCache {
                     let var_name = self.sanitize_name(&node.name);
                     let mut resolved_args = Vec::new();
                     for arg in &node.args {
+                        // Strictly resolve args, handling literals
                         resolved_args.push(self.resolve_fx_arg(arg, &var_map));
                     }
 
-                    let (expr, return_type) =
-                        self.map_fx_op(&node.target, &resolved_args, &var_map, &node_types);
+                    // Pass node_types to map_fx_op for type-aware generation
+                    let (expr, return_type) = self.map_fx_op(
+                        &node.target,
+                        &resolved_args,
+                        &var_map,
+                        &node_types,
+                        &node.args,
+                        &node.kwargs,
+                    );
                     code.push_str(&format!("        let {} = {};\n", var_name, expr));
                     var_map.insert(node.name.clone(), var_name);
                     node_types.insert(node.name.clone(), return_type);
@@ -686,6 +697,8 @@ pub struct KVCache {
     fn resolve_fx_arg(&self, arg: &serde_json::Value, var_map: &HashMap<String, String>) -> String {
         match arg {
             serde_json::Value::String(s) => var_map.get(s).cloned().unwrap_or(s.clone()),
+            serde_json::Value::Number(n) => n.to_string(), // Literal numbers
+            serde_json::Value::Bool(b) => b.to_string(),   // Literal bools
             serde_json::Value::Array(arr) => {
                 let items: Vec<String> = arr
                     .iter()
@@ -703,6 +716,8 @@ pub struct KVCache {
         args: &[String],
         var_map: &HashMap<String, String>,
         node_types: &HashMap<String, ReturnType>,
+        _raw_args: &[serde_json::Value], // Needed to check for literals
+        kwargs: &HashMap<String, serde_json::Value>,
     ) -> (String, ReturnType) {
         let target_lower = target.to_lowercase();
 
@@ -730,6 +745,83 @@ pub struct KVCache {
                 format!("(&{} / &{})?", args[0], args[1]),
                 ReturnType::Tensor,
             );
+        }
+
+        // Robust loose matching for tricky ops
+        if target.ends_with("getitem") {
+            let idx = &args[1];
+            // Find the source variable name to check its type
+            let src_name = var_map
+                .iter()
+                .find(|(_, v)| *v == &args[0])
+                .map(|(k, _)| k.as_str())
+                .unwrap_or(&args[0]);
+
+            let src_type = node_types
+                .get(src_name)
+                .cloned()
+                .unwrap_or(ReturnType::Tensor);
+
+            match src_type {
+                ReturnType::Tuple => {
+                    // Tuple indexing: x.0, x.1
+                    if let Ok(i) = idx.parse::<usize>() {
+                        return (format!("{}.{}", args[0], i), ReturnType::Tensor);
+                    } else {
+                        return (format!("{}.get({})?", args[0], args[1]), ReturnType::Tensor);
+                    }
+                }
+                ReturnType::Vec => {
+                    // Vec indexing: x[0] or x[-1]
+                    if let Ok(i) = idx.parse::<isize>() {
+                        if i < 0 {
+                            let offset = i.abs();
+                            return (
+                                format!("{}[{}.len() - {}].clone()", args[0], args[0], offset),
+                                ReturnType::Primitive,
+                            );
+                        } else {
+                            return (format!("{}[{}].clone()", args[0], i), ReturnType::Primitive);
+                        }
+                    } else {
+                        return (
+                            format!("{}[{}].clone()", args[0], args[1]),
+                            ReturnType::Primitive,
+                        );
+                    }
+                }
+                ReturnType::Tensor => {
+                    if idx.contains("slice(") || idx == "None" || idx.starts_with("&[") {
+                        // Map to .i() for indexing/slicing
+                        let mut cleaned = idx.clone();
+                        if cleaned.starts_with("&[") {
+                            cleaned = cleaned[2..cleaned.len() - 1].to_string();
+                        }
+
+                        let items: Vec<String> = cleaned
+                            .split(",")
+                            .enumerate()
+                            .map(|(i, s)| self.parse_slice_item(s.trim(), &args[0], i))
+                            .collect();
+
+                        let final_idx = if items.len() == 1 {
+                            items[0].clone()
+                        } else {
+                            format!("({})", items.join(", "))
+                        };
+
+                        return (format!("{}.i({})?", args[0], final_idx), ReturnType::Tensor);
+                    } else {
+                        return (format!("{}.get({})?", args[0], args[1]), ReturnType::Tensor);
+                    }
+                }
+                ReturnType::Primitive => {
+                    return (
+                        format!("todo!(/* primitive indexing on {} */)", args[0]),
+                        ReturnType::Primitive,
+                    );
+                }
+            }
         }
 
         // Functional ops
@@ -822,7 +914,197 @@ pub struct KVCache {
                 format!("{}.permute({})?", args[0], args[1]),
                 ReturnType::Tensor,
             ),
-            "operator.getitem" => {
+            // FEATURE: Comparisons
+            "torch.lt" | "lt" | "_operator.lt" => {
+                (format!("{}.lt(&{})?", args[0], args[1]), ReturnType::Tensor)
+            }
+            "torch.gt" | "gt" | "_operator.gt" => {
+                (format!("{}.gt(&{})?", args[0], args[1]), ReturnType::Tensor)
+            }
+            // FEATURE: SDPA
+            "torch.nn.functional.scaled_dot_product_attention"
+            | "scaled_dot_product_attention"
+            | "torch._C._nn.scaled_dot_product_attention" => {
+                let q = &args[0];
+                let k = &args[1];
+                let v = &args[2];
+
+                // Parse kwargs
+                let attn_mask_arg = kwargs.get("attn_mask").and_then(|v| v.as_str());
+                let attn_mask = if let Some(mask_name) = attn_mask_arg {
+                    // mask_name is the variable name in Python. Look it up in var_map.
+                    // If var_map has it, use it. If not, it might be "None".
+                    if mask_name == "None" || mask_name.is_empty() {
+                        "None".to_string()
+                    } else {
+                        format!(
+                            "Some(&{})",
+                            var_map.get(mask_name).unwrap_or(&mask_name.to_string())
+                        )
+                    }
+                } else {
+                    "None".to_string()
+                };
+
+                let dropout_p = kwargs
+                    .get("dropout_p")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+
+                let is_causal = kwargs
+                    .get("is_causal")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                // scale is sometimes a kwarg, sometimes optional positional.
+                // For now assuming default scale in ops.rs if not present.
+                let scale = kwargs
+                    .get("scale")
+                    .and_then(|v| v.as_f64())
+                    .map(|f| format!("Some({})", f))
+                    .unwrap_or("None".to_string());
+
+                (
+                    format!(
+                        "pycandle_core::ops::scaled_dot_product_attention({}, {}, {}, {}, {:.1}, {}, {})?",
+                        q, k, v, attn_mask, dropout_p, is_causal, scale
+                    ),
+                    ReturnType::Tensor,
+                )
+            }
+            // FEATURE: Functional Tensor Creation
+            "torch.ones" | "ones" => {
+                let shape = args[0].clone();
+                // Infer device from a previous tensor if available, else default?
+                // We will try to find the first available tensor variable in scope to steal its device/dtype
+                // or default to arbitrary choice if none (which might fail compile, but better than nothing)
+                let device_hint = var_map
+                    .values()
+                    .next()
+                    .map(|v| format!("{}.device()", v))
+                    .unwrap_or("Device::Cpu".to_string());
+                let dtype_hint = var_map
+                    .values()
+                    .next()
+                    .map(|v| format!("{}.dtype()", v))
+                    .unwrap_or("DType::F32".to_string());
+
+                // If the graph has inputs, use the first one (usually 'xs')
+                let (dev, dt) = if !var_map.is_empty() {
+                    // Try to find a variable that is a Tensor
+                    let tensor_var = var_map
+                        .iter()
+                        .find(|(k, _)| node_types.get(*k) == Some(&ReturnType::Tensor));
+                    if let Some((_, v)) = tensor_var {
+                        (format!("{}.device()", v), format!("{}.dtype()", v))
+                    } else {
+                        (device_hint, dtype_hint)
+                    }
+                } else {
+                    ("Device::Cpu".to_string(), "DType::F32".to_string())
+                };
+
+                (
+                    format!("Tensor::ones({}, {}, {})?", shape, dt, dev),
+                    ReturnType::Tensor,
+                )
+            }
+            "torch.zeros" | "zeros" => {
+                let shape = args[0].clone();
+                // Heuristic: Use first variable found for device/dtype
+                let tensor_var = var_map
+                    .iter()
+                    .filter(|(k, _)| {
+                        // Heuristic: Avoid binary op results which might be primitives masquerading as Tensors in incomplete type tracking
+                        let k = k.as_str();
+                        !k.starts_with("add")
+                            && !k.starts_with("sub")
+                            && !k.starts_with("mul")
+                            && !k.starts_with("div")
+                            && !k.starts_with("get")
+                            && !k.starts_with("size")
+                    })
+                    .find(|(k, _)| node_types.get(*k) == Some(&ReturnType::Tensor));
+                let (dev, dt) = if let Some((_, v)) = tensor_var {
+                    (format!("{}.device()", v), format!("{}.dtype()", v))
+                } else {
+                    ("Device::Cpu".to_string(), "DType::F32".to_string())
+                };
+                (
+                    format!("Tensor::zeros({}, {}, {})?", shape, dt, dev),
+                    ReturnType::Tensor,
+                )
+            }
+            "torch.arange" | "arange" => {
+                // arange(start, end, step) or arange(end)
+                // We need to check arg count
+                let tensor_var = var_map
+                    .iter()
+                    .filter(|(k, _)| {
+                        // Heuristic: Avoid binary op results which might be primitives masquerading as Tensors in incomplete type tracking
+                        let k = k.as_str();
+                        !k.starts_with("add")
+                            && !k.starts_with("sub")
+                            && !k.starts_with("mul")
+                            && !k.starts_with("div")
+                            && !k.starts_with("get")
+                            && !k.starts_with("size")
+                    })
+                    .find(|(k, _)| node_types.get(*k) == Some(&ReturnType::Tensor));
+                let dev = if let Some((_, v)) = tensor_var {
+                    format!("{}.device()", v)
+                } else {
+                    "Device::Cpu".to_string()
+                };
+
+                if args.len() == 1 {
+                    (
+                        format!("Tensor::arange(0u32, {}, {})?", args[0], dev),
+                        ReturnType::Tensor,
+                    )
+                } else if args.len() >= 2 {
+                    (
+                        format!("Tensor::arange({}, {}, {})?", args[0], args[1], dev),
+                        ReturnType::Tensor,
+                    )
+                } else {
+                    (
+                        "Tensor::arange(0u32, 1u32, Device::Cpu)?".to_string(),
+                        ReturnType::Tensor,
+                    )
+                }
+            }
+            "torch.full" => {
+                let shape = args[0].clone();
+                let fill_value = args[1].clone();
+                let tensor_var = var_map
+                    .iter()
+                    .filter(|(k, _)| {
+                        // Heuristic: Avoid binary op results which might be primitives masquerading as Tensors in incomplete type tracking
+                        let k = k.as_str();
+                        !k.starts_with("add")
+                            && !k.starts_with("sub")
+                            && !k.starts_with("mul")
+                            && !k.starts_with("div")
+                            && !k.starts_with("get")
+                            && !k.starts_with("size")
+                    })
+                    .find(|(k, _)| node_types.get(*k) == Some(&ReturnType::Tensor));
+                let (dev, dt) = if let Some((_, v)) = tensor_var {
+                    (format!("{}.device()", v), format!("{}.dtype()", v))
+                } else {
+                    ("Device::Cpu".to_string(), "DType::F32".to_string())
+                };
+                (
+                    format!(
+                        "Tensor::full({}, {}, {})?.to_dtype({})?",
+                        fill_value, shape, dev, dt
+                    ),
+                    ReturnType::Tensor,
+                )
+            }
+
+            "operator.getitem" | "_operator.getitem" => {
                 let idx = &args[1];
 
                 // Find the source variable name to check its type
@@ -879,6 +1161,10 @@ pub struct KVCache {
                             (format!("{}.get({})?", args[0], args[1]), ReturnType::Tensor)
                         }
                     }
+                    ReturnType::Primitive => (
+                        format!("todo!(/* primitive indexing on {} */)", args[0]),
+                        ReturnType::Primitive,
+                    ),
                 }
             }
             _ => {
@@ -888,6 +1174,20 @@ pub struct KVCache {
                         ReturnType::Tensor,
                     );
                 }
+                // FEATURE: In-Place Operations
+                if target_lower.contains("add_") && args.len() >= 2 {
+                    return (
+                        format!("(&{} + &{})?", args[0], args[1]),
+                        ReturnType::Tensor,
+                    );
+                }
+
+                // FEATURE: Non-Tensor Literals handling
+                // We need to wrap numerical args in Tensor if they are being used in a tensor operation
+                // This is a bit tricky without full type inference, but we can try to wrap obvious ones
+                // or just rely on Candle's impl which often accepts f64 for some scalar ops.
+                // However, things like `conv1d` expect tensors.
+                // For now, let's just make sure we print unknown ops nicely.
                 (
                     format!("todo!(/* function: {} */)", target),
                     ReturnType::Tensor,
@@ -1015,13 +1315,67 @@ pub struct KVCache {
             "contiguous" => (format!("{}.contiguous()?", self_var), ReturnType::Tensor),
             "size" => {
                 if args.is_empty() {
-                    (format!("{}.dims().to_vec()", self_var), ReturnType::Tensor)
+                    (format!("{}.dims().to_vec()", self_var), ReturnType::Vec)
                 } else {
                     (
                         format!("{}.dim({})?", self_var, args[0]),
                         ReturnType::Tensor,
                     )
                 }
+            }
+            // FEATURE: In-Place Operations (Method calls)
+            "add_" => (
+                format!("(&{} + &{})?", self_var, args[0]),
+                ReturnType::Tensor,
+            ),
+            "sub_" => (
+                format!("(&{} - &{})?", self_var, args[0]),
+                ReturnType::Tensor,
+            ),
+            "mul_" => (
+                format!("(&{} * &{})?", self_var, args[0]),
+                ReturnType::Tensor,
+            ),
+            "div_" => (
+                format!("(&{} / &{})?", self_var, args[0]),
+                ReturnType::Tensor,
+            ),
+            // Comparisons
+            "lt" | "_operator.lt" => (
+                format!("{}.lt(&{})?", self_var, args[0]),
+                ReturnType::Tensor,
+            ),
+            "gt" | "_operator.gt" => (
+                format!("{}.gt(&{})?", self_var, args[0]),
+                ReturnType::Tensor,
+            ),
+            // Ops
+            "scaled_dot_product_attention" => (
+                // Naive mapping to a potential ops::sdpa or just a placeholder if not existing
+                // Since this is a method call on a module usually, but here it might be functional.
+                // If functional: F.scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False)
+                // We'll map to a custom helper or todo with clearer message if candle doesn't have it directly.
+                // Candle has candle_nn::ops::softmax usually used.
+                // Let's assume we map it to a custom function or just todo for now but CLEANLY.
+                // actually candle-nn has it? No.
+                // We'll emit a TODO but with the arguments.
+                format!(
+                    "todo!(\"scaled_dot_product_attention({}, {}, {}, ...)\")",
+                    args.get(0).unwrap_or(&"".to_string()),
+                    args.get(1).unwrap_or(&"".to_string()),
+                    args.get(2).unwrap_or(&"".to_string())
+                ),
+                ReturnType::Tensor,
+            ),
+            "masked_fill_" => {
+                // In-place masked_fill_: tensor.masked_fill_(mask, value)
+                // Candle out-of-place: tensor.masked_fill(mask, value)
+                let mask = &args[0];
+                let value = &args[1];
+                (
+                    format!("{}.masked_fill(&{}, {})?", self_var, mask, value),
+                    ReturnType::Tensor,
+                )
             }
             _ => (
                 format!("todo!(/* method: {} on {} */)", method, self_var),
