@@ -30,6 +30,23 @@ class GoldenRecorder:
 
     def _get_module_config(self, module: nn.Module) -> Dict[str, Any]:
         cfg = {}
+        
+        # --- NEW BLOCK: Detect Weight Normalization ---
+        is_weight_norm = False
+        # Check PyTorch 2.0+ parametrizations
+        if hasattr(module, 'parametrizations') and 'weight' in module.parametrizations:
+             # Check if it's actually WeightNorm
+             for p in module.parametrizations.weight:
+                 if type(p).__name__ == "WeightNorm":
+                     is_weight_norm = True
+        # Check Legacy PyTorch weight_norm
+        elif hasattr(module, 'weight_g') and hasattr(module, 'weight_v'):
+            is_weight_norm = True
+        
+        if is_weight_norm:
+            cfg['weight_norm'] = True
+        # ---------------------------------------------
+
         if isinstance(module, nn.Linear):
             cfg = {
                 "in_features": module.in_features,

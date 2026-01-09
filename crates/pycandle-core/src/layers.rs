@@ -79,7 +79,10 @@ pub struct Snake {
 }
 impl Snake {
     pub fn load(vb: candle_nn::VarBuilder, in_features: usize) -> Result<Self> {
-        let alpha = vb.get((1, in_features, 1), "alpha")?;
+        let alpha = vb
+            .get((in_features,), "alpha")
+            .or_else(|_| vb.get((1, in_features, 1), "alpha"))?;
+        let alpha = alpha.reshape((1, in_features, 1))?;
         Ok(Self { alpha })
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -378,6 +381,40 @@ impl Transpose {
     }
 }
 
+/// ConvTranspose1d implementation
+pub struct ConvTranspose1d {
+    inner: candle_nn::ConvTranspose1d,
+}
+
+impl ConvTranspose1d {
+    pub fn load(
+        vb: candle_nn::VarBuilder,
+        in_c: usize,
+        out_c: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+    ) -> Result<Self> {
+        let weight = vb.get((in_c, out_c, kernel_size), "weight").or_else(|_| {
+            vb.pp("parametrizations.weight")
+                .get((in_c, out_c, kernel_size), "original1")
+        })?;
+        let bias = vb.get((out_c,), "bias").ok();
+
+        let config = candle_nn::ConvTranspose1dConfig {
+            stride,
+            padding,
+            ..Default::default()
+        };
+        let inner = candle_nn::ConvTranspose1d::new(weight, bias, config);
+        Ok(Self { inner })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.inner.forward(x)
+    }
+}
+
 /// Sinusoidal Positional Embedding
 pub struct SinusoidalPosEmb {
     pub dim: usize,
@@ -397,4 +434,51 @@ impl SinusoidalPosEmb {
         let emb = x.unsqueeze(1)?.broadcast_mul(&inv_freq.unsqueeze(0)?)?;
         Tensor::cat(&[emb.sin()?, emb.cos()?], 1)
     }
+}
+
+/// Helper to load a Linear layer that uses PyTorch Weight Normalization.
+/// Composes w = g * (v / ||v||) at runtime.
+pub fn load_weight_norm_linear(
+    vb: candle_nn::VarBuilder,
+    in_f: usize,
+    out_f: usize,
+    bias: bool,
+) -> Result<candle_nn::Linear> {
+    // Attempt to load 'original1' (v) and 'original0' (g) from parametrizations
+    // If not found, try legacy 'weight_v' and 'weight_g'
+
+    let v_path = if vb.contains_tensor("parametrizations.weight.original1") {
+        "parametrizations.weight.original1"
+    } else {
+        "weight_v"
+    };
+
+    let g_path = if vb.contains_tensor("parametrizations.weight.original0") {
+        "parametrizations.weight.original0"
+    } else {
+        "weight_g"
+    };
+
+    let v = vb.get((out_f, in_f), v_path)?; // Shape: [out, in]
+    let g = vb.get((out_f, 1), g_path)?; // Shape: [out, 1]
+
+    // Normalize v: v / ||v||
+    // Norm along dim 1 (input dimension) for Linear
+    let v_norm = v.sqr()?.sum_keepdim(1)?.sqrt()?;
+
+    // Compose: w = g * (v / norm)
+    let w = v.broadcast_div(&v_norm)?.broadcast_mul(&g)?;
+
+    // Transpose for Candle (Candle Linear is [out, in], but usually we transpose standard weights.
+    // However, weight_norm vectors in PT are usually [out, in].
+    // Candle's Linear::new expects weight to be [out, in].
+    // Let's standardise on returning the layer directly.
+
+    let b = if bias {
+        Some(vb.get((out_f,), "bias")?)
+    } else {
+        None
+    };
+
+    Ok(candle_nn::Linear::new(w, b))
 }

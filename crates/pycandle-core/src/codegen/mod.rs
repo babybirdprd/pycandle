@@ -151,7 +151,7 @@ impl Codegen {
         if !preferred_name.is_empty() {
             if let Some(&v) = self.config.dims.get(preferred_name) {
                 if v == value {
-                    return format!("cfg.{}", preferred_name);
+                    return format!("config.{}", preferred_name);
                 }
             }
         }
@@ -159,11 +159,54 @@ impl Codegen {
         // Try exact value match in any dim
         for (name, &v) in &self.config.dims {
             if v == value {
-                return format!("cfg.{}", name);
+                return format!("config.{}", name);
             }
         }
 
         value.to_string()
+    }
+
+    fn sanitize_name(&self, name: &str) -> String {
+        // Handle ONNX paths like /layers/0/Gather_1_output -> gather_1
+        if name.contains('/') {
+            let clean = name.trim_start_matches('/');
+            let parts: Vec<&str> = clean.split('/').collect();
+            let last = parts.last().unwrap_or(&name);
+            let mut sanitized = last.to_lowercase().replace("_output", "");
+
+            if sanitized.starts_with("node_") {
+                sanitized = sanitized.replace("node_", "x_");
+            }
+
+            // Ensure valid identifier
+            if sanitized
+                .chars()
+                .next()
+                .map(|c| !c.is_alphabetic())
+                .unwrap_or(true)
+            {
+                return format!("x_{}", sanitized);
+            }
+            return sanitized;
+        }
+
+        // Standard PyTorch names: encoder.layers.0 -> encoder_layers_0
+        let mut sanitized = name.replace(".", "_").replace("-", "_");
+        if sanitized.starts_with("node_") {
+            sanitized = sanitized.replace("node_", "x_");
+        }
+
+        // Ensure valid identifier
+        if sanitized
+            .chars()
+            .next()
+            .map(|c| !c.is_alphabetic() && c != '_')
+            .unwrap_or(true)
+        {
+            return format!("x_{}", sanitized);
+        }
+
+        sanitized
     }
 
     /// Analyze the manifest and return a structured result for JSON output
@@ -326,7 +369,7 @@ pub struct KVCache {
                 let rust_type = self.map_type(&meta.module_type);
                 code.push_str(&format!(
                     "    pub {}: {},\n",
-                    name.replace(".", "_"),
+                    self.sanitize_name(name),
                     rust_type
                 ));
             }
@@ -367,10 +410,10 @@ pub struct KVCache {
             "SiLU" => "SiLU".to_string(),
             "CausalConv1d" => "CausalConv1d".to_string(),
             "Transpose" => "Transpose".to_string(),
-            "Conv1D" => "Linear".to_string(),
+            "Conv1D" => "candle_nn::Linear".to_string(),
             "Dropout" => "Dropout".to_string(),
             "NewGELUActivation" => "candle_nn::Activation".to_string(),
-            "LoRACompatibleLinear" => "Linear".to_string(),
+            "LoRACompatibleLinear" => "candle_nn::Linear".to_string(),
             "SinusoidalPosEmb" => "SinusoidalPosEmb".to_string(),
             _ => format!("() /* TODO: {} */", py_type),
         }
@@ -380,9 +423,24 @@ pub struct KVCache {
         let mut code = format!("impl {} {{\n", model_name);
 
         // Load method
+        code.push_str("    #[allow(unused_variables)]\n");
         code.push_str(&format!(
-            "    pub fn load(_cfg: Config, vb: VarBuilder, checker: Option<PyChecker>) -> Result<Self> {{\n"
+            "    pub fn load(config: Config, vb: VarBuilder, checker: Option<PyChecker>) -> Result<Self> {{\n"
         ));
+
+        if self.has_gpt2_types() {
+            code.push_str(
+                r#"        let gpt2_cfg = pycandle_core::gpt2::Config {
+            vocab_size: config.vocab_size,
+            context_length: config.context_length,
+            emb_dim: config.hidden_dim,
+            n_heads: config.n_head,
+            n_layers: config.n_layers,
+            ..Default::default()
+        };
+"#,
+            );
+        }
 
         let mut sorted_keys: Vec<_> = self.manifest.keys().collect();
         sorted_keys.sort();
@@ -390,7 +448,7 @@ pub struct KVCache {
         for name in &sorted_keys {
             let meta = self.manifest.get(*name).unwrap();
             if meta.is_leaf {
-                let field = name.replace(".", "_");
+                let field = self.sanitize_name(name);
                 let init = self.generate_init(name, meta);
                 code.push_str(&format!("        let {} = {};\n", field, init));
             }
@@ -399,7 +457,7 @@ pub struct KVCache {
         let mut fields = vec![];
         for name in &sorted_keys {
             if self.manifest.get(*name).unwrap().is_leaf {
-                fields.push(name.replace(".", "_"));
+                fields.push(self.sanitize_name(name));
             }
         }
         fields.push("checker".to_string());
@@ -429,7 +487,7 @@ pub struct KVCache {
                 if !meta.is_leaf {
                     continue;
                 }
-                let clean_name = name.replace(".", "_");
+                let clean_name = self.sanitize_name(name);
                 let forward_call = if self.map_type(&meta.module_type) == "LSTM" {
                     format!("self.{}.forward(&x)?.0", clean_name)
                 } else {
@@ -499,8 +557,8 @@ pub struct KVCache {
                     placeholder_idx += 1;
                 }
                 "call_module" => {
-                    let clean_name = node.target.replace(".", "_");
-                    let var_name = format!("x_{}", node.name);
+                    let clean_name = self.sanitize_name(&node.target);
+                    let var_name = self.sanitize_name(&node.name);
                     let input_var = if let Some(arg0) = node.args.get(0) {
                         match arg0 {
                             serde_json::Value::String(s) => {
@@ -555,7 +613,7 @@ pub struct KVCache {
                     node_types.insert(node.name.clone(), return_type);
                 }
                 "call_function" => {
-                    let var_name = format!("x_{}", node.name);
+                    let var_name = self.sanitize_name(&node.name);
                     let mut resolved_args = Vec::new();
                     for arg in &node.args {
                         resolved_args.push(self.resolve_fx_arg(arg, &var_map));
@@ -568,7 +626,7 @@ pub struct KVCache {
                     node_types.insert(node.name.clone(), return_type);
                 }
                 "call_method" => {
-                    let var_name = format!("x_{}", node.name);
+                    let var_name = self.sanitize_name(&node.name);
                     let mut resolved_args = Vec::new();
                     for arg in &node.args {
                         resolved_args.push(self.resolve_fx_arg(arg, &var_map));
@@ -972,6 +1030,31 @@ pub struct KVCache {
         }
     }
 
+    fn infer_linear_dims(&self, meta: &LayerMeta) -> (usize, usize) {
+        let in_f = meta.config.get("in_features").and_then(|v| v.as_u64());
+        let out_f = meta.config.get("out_features").and_then(|v| v.as_u64());
+
+        if let (Some(i), Some(o)) = (in_f, out_f) {
+            return (i as usize, o as usize);
+        }
+
+        // Fallback to shapes if config is missing (common in ONNX or custom layers)
+        let in_shape = meta
+            .input_shapes
+            .first()
+            .and_then(|s| s.last())
+            .copied()
+            .unwrap_or(0);
+        let out_shape = meta
+            .output_shapes
+            .first()
+            .and_then(|s| s.last())
+            .copied()
+            .unwrap_or(0);
+
+        (in_shape, out_shape)
+    }
+
     fn generate_init(&self, layer_name: &str, meta: &LayerMeta) -> String {
         // Check GPT2 helper first
         if let Some(init) = gpt2::generate_init(layer_name, meta, &self.config.dims) {
@@ -979,13 +1062,27 @@ pub struct KVCache {
         }
 
         // Core types
+        // NEW: Check for weight norm flag
+        let is_weight_norm = meta
+            .config
+            .get("weight_norm")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         match meta.module_type.as_str() {
-            "Linear" | "LoRACompatibleLinear" => {
-                let in_f_val = meta.config["in_features"].as_u64().unwrap_or(0) as usize;
-                let out_f_val = meta.config["out_features"].as_u64().unwrap_or(0) as usize;
+            "Linear" | "LoRACompatibleLinear" | "Conv1D" => {
+                let (in_f_val, out_f_val) = self.infer_linear_dims(meta);
                 let in_f = self.render_dim(in_f_val, "hidden_dim");
                 let out_f = self.render_dim(out_f_val, "");
                 let bias = meta.config["bias"].as_bool().unwrap_or(true);
+
+                if is_weight_norm {
+                    // Generate call to the new helper
+                    return format!(
+                        "pycandle_core::layers::load_weight_norm_linear(vb.pp(\"{}\"), {}, {}, {})?",
+                        layer_name, in_f, out_f, bias
+                    );
+                }
 
                 // Check for weight shape to detect transpose needs
                 let needs_transpose = meta
@@ -1002,7 +1099,7 @@ pub struct KVCache {
                 if needs_transpose {
                     format!(
                         "{{ let w = vb.pp(\"{}\").get(({}, {}), \"weight\")?.t()?; \
-                         let b = {}; Linear::new(w, b) }}",
+                         let b = {}; candle_nn::Linear::new(w, b) }}",
                         layer_name,
                         in_f,
                         out_f,
@@ -1170,22 +1267,6 @@ pub struct KVCache {
             "Mish" => "Mish".to_string(),
             "SiLU" => "SiLU".to_string(),
             // GPT2 specific
-            "Conv1D" => {
-                let out_f_val = meta.config["nf"].as_u64().unwrap_or(0) as usize;
-                let out_f = self.render_dim(out_f_val, "");
-                let nx_val =
-                    if let Some(ws) = meta.config.get("weight_shape").and_then(|v| v.as_array()) {
-                        ws.get(0).and_then(|x| x.as_u64()).unwrap_or(0) as usize
-                    } else {
-                        0
-                    };
-                let nx = self.render_dim(nx_val, "hidden_dim");
-
-                format!(
-                    "candle_nn::linear({}, {}, vb.pp(\"{}\"))?",
-                    nx, out_f, layer_name
-                )
-            }
             "NewGELUActivation" => "candle_nn::Activation::NewGelu".to_string(),
             "Dropout" => "Dropout::new()".to_string(),
             "Transpose" => {
@@ -1220,5 +1301,29 @@ pub struct KVCache {
             }
         }
         "Result<Tensor>".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_sanitize_name() {
+        let codegen = Codegen::new(HashMap::new(), None);
+
+        // PyTorch names
+        assert_eq!(
+            codegen.sanitize_name("encoder.layers.0"),
+            "encoder_layers_0"
+        );
+        assert_eq!(codegen.sanitize_name("node_123"), "x_123");
+        assert_eq!(codegen.sanitize_name("123_invalid"), "x_123_invalid");
+
+        // ONNX names
+        assert_eq!(codegen.sanitize_name("/layers/0/Gemm_output"), "gemm");
+        assert_eq!(codegen.sanitize_name("/node_456"), "x_456");
+        assert_eq!(codegen.sanitize_name("/Gather_1_output"), "gather_1");
     }
 }

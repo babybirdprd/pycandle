@@ -57,40 +57,41 @@ fn conv1d(in_f: usize, out_f: usize, vb: VarBuilder) -> Result<Linear> {
     let bias = vb.get((out_f,), "bias")?;
     Ok(Linear::new(weight, Some(bias)))
 }
-
 pub struct MultiHeadAttention {
     c_attn: Linear,
     c_proj: Linear,
     n_head: usize,
     head_dim: usize,
-    bias: Tensor,
     scale: f64,
 }
 
 impl MultiHeadAttention {
-    pub fn new(n_embd: usize, n_head: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn new(
+        n_embd: usize,
+        n_head: usize,
+        _context_length: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let c_attn = conv1d(n_embd, 3 * n_embd, vb.pp("c_attn"))?;
         let c_proj = conv1d(n_embd, n_embd, vb.pp("c_proj"))?;
         let head_dim = n_embd / n_head;
         let scale = 1.0 / (head_dim as f64).sqrt();
-
-        // Causal mask buffer
-        let mask: Vec<_> = (0..1024)
-            .flat_map(|i| (0..1024).map(move |j| if j <= i { 1.0f32 } else { 0.0f32 }))
-            .collect();
-        let bias = Tensor::from_vec(mask, (1, 1, 1024, 1024), vb.device())?;
 
         Ok(Self {
             c_attn,
             c_proj,
             n_head,
             head_dim,
-            bias,
             scale,
         })
     }
 
-    pub fn forward(&self, x: &Tensor, layer_cache: Option<&mut Option<KVCache>>) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        layer_cache: Option<&mut Option<KVCache>>,
+    ) -> Result<Tensor> {
         let (b_sz, t, c) = x.dims3()?;
         let qkv = self.c_attn.forward(x)?;
 
@@ -129,22 +130,15 @@ impl MultiHeadAttention {
         // q: (B, H, T_q, D) @ k.t: (B, H, D, T_k) -> (B, H, T_q, T_k)
         let att = (q.matmul(&k.t()?)? * self.scale)?;
 
-        // Causal masking
-        let mask = self.bias.narrow(2, 0, t)?; // Slice to current query len
-        let mask = mask.narrow(3, 0, t_total)?; // Slice to total key len
-
-        // In inference with cache, we only generate 1 token usually, but causal mask expects full sequence
-        // Actually, if we are generating 1 token at pos P, we attend to all previous P tokens.
-        // The mask handles the tril logic.
-        // For cached inference (q len 1, k len T), we want full attention to previous.
-        // The bias implementation above is static (1024,1024).
-        // We should just direct mask if t > 1.
-        // If t == 1 (generation), we attend to everything, no lower-triangular needed for the single row.
-
-        let att = if t > 1 {
+        let att = if let Some(mask) = mask {
             let infinite =
                 Tensor::new(f32::NEG_INFINITY, att.device())?.broadcast_as(att.shape())?;
-            mask.eq(0.0)?.where_cond(&infinite, &att)?
+            let mask = mask
+                .narrow(2, 0, t)?
+                .narrow(3, 0, t_total)?
+                .eq(0.0)?
+                .broadcast_as(att.shape())?;
+            mask.where_cond(&infinite, &att)?
         } else {
             att // Attend to all past
         };
@@ -192,9 +186,14 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    pub fn new(n_embd: usize, n_head: usize, vb: VarBuilder) -> Result<Self> {
+    pub fn new(
+        n_embd: usize,
+        n_head: usize,
+        context_length: usize,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let ln_1 = candle_nn::layer_norm(n_embd, 1e-5, vb.pp("ln_1"))?;
-        let attn = MultiHeadAttention::new(n_embd, n_head, vb.pp("attn"))?;
+        let attn = MultiHeadAttention::new(n_embd, n_head, context_length, vb.pp("attn"))?;
         let ln_2 = candle_nn::layer_norm(n_embd, 1e-5, vb.pp("ln_2"))?;
         let mlp = FeedForward::new(n_embd, vb.pp("mlp"))?;
         Ok(Self {
@@ -205,10 +204,15 @@ impl TransformerBlock {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, layer_cache: Option<&mut Option<KVCache>>) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        layer_cache: Option<&mut Option<KVCache>>,
+    ) -> Result<Tensor> {
         let residual = x;
         let x = self.ln_1.forward(x)?;
-        let x = self.attn.forward(&x, layer_cache)?;
+        let x = self.attn.forward(&x, mask, layer_cache)?;
         let x = (x + residual)?;
 
         let residual = &x;
@@ -218,12 +222,12 @@ impl TransformerBlock {
         Ok(x)
     }
 }
-
 pub struct GPTModel {
-    wte: Embedding,
-    wpe: Embedding,
-    h: Vec<TransformerBlock>,
-    ln_f: LayerNorm,
+    pub wte: Embedding,
+    pub wpe: Embedding,
+    pub h: Vec<TransformerBlock>,
+    pub ln_f: LayerNorm,
+    pub mask: Option<Tensor>,
 }
 
 impl GPTModel {
@@ -236,13 +240,32 @@ impl GPTModel {
             h.push(TransformerBlock::new(
                 cfg.emb_dim,
                 cfg.n_heads,
+                cfg.context_length,
                 vb.pp(format!("h.{}", i)),
             )?);
         }
 
         let ln_f = candle_nn::layer_norm(cfg.emb_dim, 1e-5, vb.pp("ln_f"))?;
 
-        Ok(Self { wte, wpe, h, ln_f })
+        // Causal mask buffer - compute once
+        let mask: Vec<_> = (0..cfg.context_length)
+            .flat_map(|i| {
+                (0..cfg.context_length).map(move |j| if j <= i { 1.0f32 } else { 0.0f32 })
+            })
+            .collect();
+        let mask = Tensor::from_vec(
+            mask,
+            (1, 1, cfg.context_length, cfg.context_length),
+            vb.device(),
+        )?;
+
+        Ok(Self {
+            wte,
+            wpe,
+            h,
+            ln_f,
+            mask: Some(mask),
+        })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -282,7 +305,7 @@ impl GPTModel {
             } else {
                 None
             };
-            x = block.forward(&x, layer_cache)?;
+            x = block.forward(&x, self.mask.as_ref(), layer_cache)?;
         }
 
         self.ln_f.forward(&x)

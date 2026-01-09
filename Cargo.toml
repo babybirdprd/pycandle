@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pycandle", "crates/pycandle-core", "crates/pycandle-audio"]
+members = ["crates/pycandle", "crates/pycandle-core", "crates/pycandle-audio", "dx_simulation"]
 resolver = "2"
 
 [workspace.package]
@@ -9,8 +9,9 @@ license = "MIT"
 
 [workspace.dependencies]
 # Candle ML framework
-candle-core = "0.8.2"
-candle-nn = "0.8.2"
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
 
 # Serialization
 safetensors = "0.5.2"
@@ -26,6 +27,9 @@ walkdir = "2.4"
 regex = "1.10"
 realfft = "3.3"
 num-complex = "0.4"
+hf-hub = "0.4.0"
+tokenizers = "0.20"
+hound = "3.5"
 
 # Internal crates
 pycandle-core = { path = "crates/pycandle-core" }

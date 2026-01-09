@@ -313,20 +313,16 @@ Extending the verification engine to quantized models:
 3.  **Verifiable Crate:** Generated code with `py_check!` macros that "lights up" green as you implement layers.
 4.  **Diagnostics:** A visual report and Python debug scripts showing exactly where the "Math Leak" is happening.
 ---
-### The "Universal Transpiler" Roadmap (ONNX Edition)
+### 🌐 Universal ONNX Transpilation
+**Status: Prototype (via `onnx2torch`) 🛠️**
 
-#### 🌐 Universal ONNX Transpilation
-**Status: Researching 🔍**
-- **Direct Graph Parsing:** Generate Candle Rust code directly from `.onnx` files without requiring Python source code.
-- **Operator Mapping:** Translation layer to map standard ONNX Ops (Opset 15-21) to optimized Candle kernels.
-- **Multi-Framework Support:** Enable porting from JAX and TensorFlow to Candle via the ONNX intermediate representation.
-- **Reference Parity:** Support `onnxruntime` as a verification backend for `PyChecker`.
-
----
+- **Bridge Strategy:** Automatically converts ONNX models to PyTorch in-memory, then traces them with `torch.fx` to generate idiomatic Rust.
+- **CLI Integration:** `pycandle onnx-convert --onnx model.onnx --name my_model` handles the conversion pipeline automatically.
+- **Dynamic Shape Inference:** Automatically detects input dimensions from the ONNX graph definition, defaulting dynamic axes to `1`.
 
 ### Technical Challenges to Watch For:
 1.  **The "Opset" Nightmare:** ONNX has many versions (Opsets). You’ll need to focus on the most common ones (Opset 17+).
-2.  **Naming Conventions:** ONNX often renames layers to generic IDs (like `node_1`, `node_2`). This makes the generated Rust code harder to read than your current `torch.fx` approach, which keeps the original PyTorch names.
+2.  **Naming Conventions:** ONNX often renames layers to generic IDs (like `node_1`, `node_2`). v1.1 will include a "Sanitizer" pass in `codegen/mod.rs` to keep generated Rust code readable.
 3.  **Complex Ops:** Some ONNX ops (like `EinsteinSum` or complex `Loop` nodes) are very hard to map to Candle.
 
 ### Should you do it?

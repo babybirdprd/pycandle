@@ -308,7 +308,7 @@ pub fn mel_spectrogram(
     let power = power.transpose(power.dims().len() - 2, power.dims().len() - 1)?;
     // power is (B, n_frames, n_bins)
 
-    let mel_spec = power.matmul(&mel_banks.transpose(0, 1)?)?;
+    let mel_spec = power.broadcast_matmul(&mel_banks.transpose(0, 1)?)?;
     // mel_spec is (B, n_frames, n_mels)
 
     mel_spec.transpose(mel_spec.dims().len() - 2, mel_spec.dims().len() - 1)

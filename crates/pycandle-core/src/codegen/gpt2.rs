@@ -93,13 +93,13 @@ pub fn generate_init(
         if !preferred.is_empty() {
             if let Some(&v) = symbolic_dims.get(preferred) {
                 if v == val {
-                    return format!("cfg.{}", preferred);
+                    return format!("config.{}", preferred);
                 }
             }
         }
         for (name, &v) in symbolic_dims {
             if v == val {
-                return format!("cfg.{}", name);
+                return format!("config.{}", name);
             }
         }
         val.to_string()
@@ -107,16 +107,16 @@ pub fn generate_init(
 
     match meta.module_type.as_str() {
         "GPT2Model" | "GPT2LMHeadModel" => {
-            let cfg = extract_config(meta);
-            let vocab_size = render_dim(cfg.vocab_size, "vocab_size");
-            let context_length = render_dim(cfg.context_length, "context_length");
-            let emb_dim = render_dim(cfg.emb_dim, "hidden_dim");
-            let n_heads = render_dim(cfg.n_heads, "n_head");
-            let n_layers = render_dim(cfg.n_layers, "n_layers");
+            let config_val = extract_config(meta);
+            let vocab_size = render_dim(config_val.vocab_size, "vocab_size");
+            let context_length = render_dim(config_val.context_length, "context_length");
+            let emb_dim = render_dim(config_val.emb_dim, "hidden_dim");
+            let n_heads = render_dim(config_val.n_heads, "n_head");
+            let n_layers = render_dim(config_val.n_layers, "n_layers");
 
             Some(format!(
                 r#"{{
-                let gpt_cfg = gpt2::Config {{
+                let gpt_cfg = pycandle_core::gpt2::Config {{
                     vocab_size: {},
                     context_length: {},
                     emb_dim: {},
@@ -125,13 +125,19 @@ pub fn generate_init(
                     drop_rate: {:.1},
                     qkv_bias: false,
                 }};
-                gpt2::GPTModel::new(gpt_cfg, &vb.pp("{}"))?
+                pycandle_core::gpt2::GPTModel::new(gpt_cfg, &vb.pp("{}"))?
             }}"#,
-                vocab_size, context_length, emb_dim, n_heads, n_layers, cfg.drop_rate, layer_name
+                vocab_size,
+                context_length,
+                emb_dim,
+                n_heads,
+                n_layers,
+                config_val.drop_rate,
+                layer_name
             ))
         }
         "GPT2Block" => Some(format!(
-            "gpt2::TransformerBlock::new(gpt_cfg, &vb.pp(\"{}\"))?",
+            "pycandle_core::gpt2::TransformerBlock::new(gpt2_cfg, &vb.pp(\"{}\"))?",
             layer_name
         )),
         "GPT2Attention" => {
@@ -149,12 +155,12 @@ pub fn generate_init(
             let heads = render_dim(heads_val, "n_head");
 
             Some(format!(
-                "gpt2::MultiHeadAttention::new({}, {}, 0.1, {}, false, &vb.pp(\"{}\"))?",
+                "pycandle_core::gpt2::MultiHeadAttention::new({}, {}, 0.1, {}, false, &vb.pp(\"{}\"))?",
                 dim, dim, heads, layer_name
             ))
         }
         "GPT2MLP" => Some(format!(
-            "gpt2::FeedForward::new(gpt_cfg, &vb.pp(\"{}\"))?",
+            "pycandle_core::gpt2::FeedForward::new(gpt2_cfg, &vb.pp(\"{}\"))?",
             layer_name
         )),
         _ => None,
