@@ -211,6 +211,28 @@ impl BatchNorm2d {
     }
 }
 
+/// LlamaRMSNorm: Root Mean Square Layer Normalization
+pub struct LlamaRMSNorm {
+    pub weight: Tensor,
+    pub eps: f64,
+}
+
+impl LlamaRMSNorm {
+    pub fn load(vb: candle_nn::VarBuilder, size: usize, eps: f64) -> Result<Self> {
+        let weight = vb.get(size, "weight")?;
+        Ok(Self { weight, eps })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_dtype = x.dtype();
+        let internal_dtype = candle_core::DType::F32;
+        let x = x.to_dtype(internal_dtype)?;
+        let norm_x = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
+        x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)
+    }
+}
+
 // ============================================================================
 // Recurrent Layers
 // ============================================================================

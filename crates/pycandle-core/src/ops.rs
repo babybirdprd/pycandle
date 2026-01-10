@@ -22,7 +22,7 @@ pub fn scaled_dot_product_attention(
     key: &Tensor,
     value: &Tensor,
     attn_mask: Option<&Tensor>,
-    dropout_p: f64,
+    mut _dropout_p: f64,
     is_causal: bool,
     scale: Option<f64>,
 ) -> Result<Tensor> {
@@ -134,7 +134,13 @@ pub fn reshape(tensor: &Tensor, shape: &[isize]) -> Result<Tensor> {
     tensor.reshape(&dims[..])
 }
 
-pub fn split(tensor: &Tensor, split_size: usize, dim: usize) -> Result<Vec<Tensor>> {
+pub fn split(tensor: &Tensor, split_size: usize, dim: isize) -> Result<Vec<Tensor>> {
+    let dim = if dim < 0 {
+        tensor.dims().len() as isize + dim
+    } else {
+        dim
+    } as usize;
+
     let dim_size = tensor.dim(dim)?;
     let mut chunks = Vec::new();
     let mut start = 0;
@@ -144,6 +150,65 @@ pub fn split(tensor: &Tensor, split_size: usize, dim: usize) -> Result<Vec<Tenso
         start += size;
     }
     Ok(chunks)
+}
+
+pub fn lt(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+    let (lhs, rhs) = broadcast_v2(lhs, rhs)?;
+    lhs.lt(&rhs)
+}
+
+pub fn gt(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+    let (lhs, rhs) = broadcast_v2(lhs, rhs)?;
+    lhs.gt(&rhs)
+}
+
+fn broadcast_v2(lhs: &Tensor, rhs: &Tensor) -> Result<(Tensor, Tensor)> {
+    let mut lhs_shape = lhs.dims().to_vec();
+    let mut rhs_shape = rhs.dims().to_vec();
+
+    if lhs_shape == rhs_shape {
+        return Ok((lhs.clone(), rhs.clone()));
+    }
+
+    let max_ndims = std::cmp::max(lhs_shape.len(), rhs_shape.len());
+    while lhs_shape.len() < max_ndims {
+        lhs_shape.insert(0, 1);
+    }
+    while rhs_shape.len() < max_ndims {
+        rhs_shape.insert(0, 1);
+    }
+
+    let mut out_shape = Vec::with_capacity(max_ndims);
+    for i in 0..max_ndims {
+        let l = lhs_shape[i];
+        let r = rhs_shape[i];
+        if l == r {
+            out_shape.push(l);
+        } else if l == 1 {
+            out_shape.push(r);
+        } else if r == 1 {
+            out_shape.push(l);
+        } else {
+            candle_core::bail!(
+                "Incompatible shapes for broadcasting: {:?} and {:?}",
+                lhs.shape(),
+                rhs.shape()
+            );
+        }
+    }
+
+    let lhs = if lhs.dims() != &out_shape {
+        lhs.broadcast_as(out_shape.as_slice())?
+    } else {
+        lhs.clone()
+    };
+    let rhs = if rhs.dims() != &out_shape {
+        rhs.broadcast_as(out_shape.as_slice())?
+    } else {
+        rhs.clone()
+    };
+
+    Ok((lhs, rhs))
 }
 
 pub enum IndexItem {

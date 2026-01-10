@@ -421,6 +421,7 @@ pub struct KVCache {
             "Dropout" => "Dropout".to_string(),
             "NewGELUActivation" => "candle_nn::Activation".to_string(),
             "LoRACompatibleLinear" => "candle_nn::Linear".to_string(),
+            "LlamaRMSNorm" => "LlamaRMSNorm".to_string(),
             "SinusoidalPosEmb" => "SinusoidalPosEmb".to_string(),
             _ => format!("() /* TODO: {} */", py_type),
         }
@@ -705,6 +706,8 @@ pub struct KVCache {
                             &self_var_name,
                             method_args,
                             &node_types,
+                            &node.kwargs,
+                            &var_map,
                         );
                         code.push_str(&format!("        let {} = {};\n", var_name, expr));
                         var_map.insert(node.name.clone(), var_name);
@@ -946,7 +949,13 @@ pub struct KVCache {
             }
             "torch.chunk" | "chunk" => {
                 let chunks = args.get(1).map(|s| s.as_str()).unwrap_or("2");
-                let dim = args.get(2).map(|s| s.as_str()).unwrap_or("0");
+                let dim = if let Some(v) = kwargs.get("dim") {
+                    self.resolve_fx_arg(v, var_map)
+                } else if args.len() > 2 {
+                    args[2].clone()
+                } else {
+                    "0".to_string()
+                };
                 (
                     format!("{}.chunk({}, {})?", args[0], chunks, dim),
                     ReturnType::Vec,
@@ -954,7 +963,13 @@ pub struct KVCache {
             }
             "torch.split" | "split" => {
                 let split_size = args.get(1).map(|s| s.as_str()).unwrap_or("1");
-                let dim = args.get(2).map(|s| s.as_str()).unwrap_or("0");
+                let dim = if let Some(v) = kwargs.get("dim") {
+                    self.resolve_fx_arg(v, var_map)
+                } else if args.len() > 2 {
+                    args[2].clone()
+                } else {
+                    "0".to_string()
+                };
                 (
                     format!("{}.split({}, {})?", args[0], split_size, dim),
                     ReturnType::Vec,
@@ -1017,6 +1032,30 @@ pub struct KVCache {
                 format!("{}.permute({})?", args[0], args[1]),
                 ReturnType::Tensor,
             ),
+            "torch.addmm" | "addmm" | "aten.addmm" => {
+                // addmm(bias, a, b) -> (a @ b) + bias
+                // a is typically input, b is typically weight (out, in) in Candle, so we need b.t()
+                if args.len() >= 3 {
+                    let w = &args[2];
+                    // Heuristic: if b is a weight attribute, it likely needs transposition for matmul
+                    let w_suffix = if w.contains("weight") || w.contains("w_") {
+                        ".t()?"
+                    } else {
+                        ""
+                    };
+                    return (
+                        format!(
+                            "{}.matmul(&{}{})?.broadcast_add(&{})?",
+                            args[1], w, w_suffix, args[0]
+                        ),
+                        ReturnType::Tensor,
+                    );
+                }
+                (
+                    format!("todo!(/* addmm with {} args */)", args.len()),
+                    ReturnType::Tensor,
+                )
+            }
             // FEATURE: Comparisons
             "torch.lt" | "lt" | "_operator.lt" => {
                 // Check types for primitive comparison
@@ -1035,7 +1074,11 @@ pub struct KVCache {
                         ReturnType::Primitive,
                     )
                 } else {
-                    (format!("{}.lt(&{})?", args[0], args[1]), ReturnType::Tensor)
+                    // BROADCAST FIX: Ensure shapes are compatible for Candle comparison
+                    (
+                        format!("pycandle_core::ops::lt(&{}, &{})?", args[0], args[1]),
+                        ReturnType::Tensor,
+                    )
                 }
             }
             "torch.gt" | "gt" | "_operator.gt" => {
@@ -1054,34 +1097,35 @@ pub struct KVCache {
                         ReturnType::Primitive,
                     )
                 } else {
-                    (format!("{}.gt(&{})?", args[0], args[1]), ReturnType::Tensor)
+                    // BROADCAST FIX: Ensure shapes are compatible for Candle comparison
+                    (
+                        format!("pycandle_core::ops::gt(&{}, &{})?", args[0], args[1]),
+                        ReturnType::Tensor,
+                    )
                 }
             }
             "slice" => {
                 let start = args.get(0).map(|s| s.as_str()).unwrap_or("None");
                 let stop = args.get(1).map(|s| s.as_str()).unwrap_or("None");
-                // Generating a temporary helper call that returns a Range
-                // This assumes `pycandle_core::ops::slice` exists or logic that handles it
-                // Actually, `to.i()` uses custom parsing of IndexOp.
-                // We should output a string that `parse_slice_item` understands OR standard Rust range syntax.
-                // But `to.i` takes valid Rust syntax.
-                // `slice(None.., None, None)` is what triggered error.
-                // Let's output valid Rust range if possible, or a custom struct?
-                // `to.i` implementation in candle doesn't support arbitrary `slice()` function.
-                // We need to map `slice(start, stop)` to `start..stop`
 
-                let start_s = if start == "None" {
-                    "".to_string()
+                let start_s = if start == "None" || start.is_empty() {
+                    "None".to_string()
                 } else {
-                    start.to_string()
+                    format!("Some({})", start)
                 };
-                let stop_s = if stop == "None" {
-                    "".to_string()
+                let stop_s = if stop == "None" || stop.is_empty() {
+                    "None".to_string()
                 } else {
-                    stop.to_string()
+                    format!("Some({})", stop)
                 };
 
-                (format!("{}..{}", start_s, stop_s), ReturnType::Primitive)
+                (
+                    format!(
+                        "pycandle_core::ops::IndexItem::Slice({}, {})",
+                        start_s, stop_s
+                    ),
+                    ReturnType::Primitive,
+                )
             }
             // FEATURE: SDPA
             "torch.nn.functional.scaled_dot_product_attention"
@@ -1280,7 +1324,13 @@ pub struct KVCache {
             }
             "torch.full" => {
                 let shape = args[0].clone();
-                let fill_value = args[1].clone();
+                let fill_value = if let Some(v) = kwargs.get("fill_value") {
+                    self.resolve_fx_arg(v, var_map)
+                } else if args.len() > 1 {
+                    args[1].clone()
+                } else {
+                    "0.0".to_string()
+                };
                 let tensor_var = var_map
                     .iter()
                     .filter(|(k, _)| {
@@ -1720,6 +1770,8 @@ pub struct KVCache {
         self_var_name: &str,
         args: &[String],
         node_types: &HashMap<String, ReturnType>,
+        kwargs: &HashMap<String, serde_json::Value>,
+        var_map: &HashMap<String, String>,
     ) -> (String, ReturnType) {
         let _src_type = node_types
             .get(self_var_name)
@@ -1811,7 +1863,24 @@ pub struct KVCache {
             // Casting / Device Movement
             "to" => {
                 // .to(dtype) or .to(device)
-                if args.len() == 1 {
+                if args.is_empty() {
+                    let dtype_val = kwargs.get("dtype").and_then(|v| v.as_str());
+                    let device_val = kwargs.get("device").and_then(|v| v.as_str());
+
+                    if let Some(dt) = dtype_val {
+                        (
+                            format!("{}.to_dtype({})?", self_var, dt),
+                            ReturnType::Tensor,
+                        )
+                    } else if let Some(dv) = device_val {
+                        (
+                            format!("{}.to_device(&{})?", self_var, dv),
+                            ReturnType::Tensor,
+                        )
+                    } else {
+                        (self_var.to_string(), ReturnType::Tensor)
+                    }
+                } else if args.len() == 1 {
                     if args[0].contains("DType") {
                         (
                             format!("{}.to_dtype({})?", self_var, args[0]),
@@ -1923,7 +1992,7 @@ pub struct KVCache {
                     )
                 } else {
                     (
-                        format!("{}.lt(&{})?", self_var, args[0]),
+                        format!("pycandle_core::ops::lt(&{}, &{})?", self_var, args[0]),
                         ReturnType::Tensor,
                     )
                 }
@@ -1943,7 +2012,7 @@ pub struct KVCache {
                     )
                 } else {
                     (
-                        format!("{}.gt(&{})?", self_var, args[0]),
+                        format!("pycandle_core::ops::gt(&{}, &{})?", self_var, args[0]),
                         ReturnType::Tensor,
                     )
                 }
@@ -2129,11 +2198,27 @@ pub struct KVCache {
                 let shape_str = if shape.len() == 1 {
                     format!("{}", shape[0])
                 } else {
-                    format!("Shape::from(vec!{:?})", shape)
+                    format!("&{:?}", shape)
                 };
                 format!(
-                    "candle_nn::layer_norm({}, candle_nn::LayerNormConfig {{ eps: {:.1e}, ..Default::default() }}, vb.pp(\"{}\"))?",
+                    "candle_nn::layer_norm({}, candle_nn::LayerNormConfig {{ eps: {:e}, ..Default::default() }}, vb.pp(\"{}\"))?",
                     shape_str, eps, layer_name
+                )
+            }
+            "LlamaRMSNorm" => {
+                let eps = meta.config["variance_epsilon"].as_f64().unwrap_or(1e-5);
+                // In Llama, the size is usually the last dimension of the weight
+                let size = meta
+                    .config
+                    .get("weight_shape")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.last())
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(1024); // Fallback to 1024 if unknown
+                format!(
+                    "LlamaRMSNorm::load(vb.pp(\"{}\"), {}, {:e})?",
+                    layer_name, size, eps
                 )
             }
             "Embedding" => {

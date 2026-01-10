@@ -247,6 +247,8 @@ class GoldenRecorder:
         def serialize_arg(arg):
             if isinstance(arg, (list, tuple)):
                 return [serialize_arg(a) for a in arg]
+            if isinstance(arg, dict):
+                return {k: serialize_arg(v) for k, v in arg.items()}
             if hasattr(arg, "name"):
                 return arg.name
             return str(arg)
@@ -269,6 +271,7 @@ class GoldenRecorder:
                 "op": node.op,
                 "target": serialize_target(node.target),
                 "args": [serialize_arg(arg) for arg in node.args],
+                "kwargs": {k: serialize_arg(v) for k, v in node.kwargs.items()},
             }
             
             if node.op == "call_module":
