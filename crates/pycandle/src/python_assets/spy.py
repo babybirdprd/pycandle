@@ -48,7 +48,7 @@ class GoldenRecorder:
             cfg['weight_norm'] = True
         # ---------------------------------------------
 
-        if isinstance(module, nn.Linear):
+        if isinstance(module, nn.Linear) or type(module).__name__ == "LoRACompatibleLinear":
             cfg = {
                 "in_features": module.in_features,
                 "out_features": module.out_features,
@@ -56,6 +56,28 @@ class GoldenRecorder:
                 # Record actual weight shape for transpose detection
                 "weight_shape": list(module.weight.shape),  # [out, in] in PyTorch
             }
+        
+        elif isinstance(module, nn.Upsample):
+            cfg = {
+                "size": module.size,
+                "scale_factor": module.scale_factor,
+                "mode": module.mode,
+                "align_corners": module.align_corners,
+            }
+        
+        elif isinstance(module, nn.ReflectionPad1d):
+            cfg = {
+                "padding": module.padding[0] if isinstance(module.padding, (tuple, list)) else module.padding
+            }
+
+        elif type(module).__name__ == "SineGen":
+             cfg = {
+                "harmonic_num": getattr(module, "harmonic_num", 0),
+                "sine_amp": getattr(module, "sine_amp", 0.1),
+                "noise_std": getattr(module, "noise_std", 0.003),
+                "sampling_rate": getattr(module, "sampling_rate", 24000),
+                "voiced_threshold": getattr(module, "voiced_threshold", 0),
+             }
         elif isinstance(module, nn.Conv1d) or type(module).__name__ == "Conv1d":
             cfg = {
                 "in_channels": module.in_channels,
@@ -188,7 +210,7 @@ class GoldenRecorder:
                 "Sigmoid", "Tanh", "ELU", "LeakyReLU", "Snake", "BatchNorm1d", "BatchNorm2d",
                 "LSTM", "CausalConv1d", "Mish", "SiLU", "NewGELUActivation", "Dropout",
                 "Transpose", "SinusoidalPosEmb", "LlamaRMSNorm", "ModuleList", "Sequential",
-                "Conv1D"
+                "Conv1D", "LoRACompatibleLinear", "Upsample", "ReflectionPad1d", "SineGen", "_WeightNorm"
             }
             if module_type not in supported_ops and len(list(m.children())) == 0:
                 print(f"⚠️  WARNING: Custom or potentially unsupported Op detected: {module_type} ({name})")
