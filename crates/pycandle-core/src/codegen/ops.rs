@@ -362,13 +362,65 @@ impl super::Codegen {
                     .map(|f| format!("Some({})", f))
                     .unwrap_or("None".to_string());
 
-                (
-                    format!(
-                        "pycandle_core::ops::scaled_dot_product_attention(&{}, &{}, &{}, {}, {:.1}, {}, {})?",
-                        q, k, v, attn_mask, dropout_p, is_causal, scale
-                    ),
-                    ReturnType::Tensor,
-                )
+                // Check if we can use Flash Attention (requires no explicit mask, assuming causal or no mask)
+                // If an explicit mask is provided, Flash Attention usually doesn't support it directly in the standard API without specific construction.
+                // We will only enable Flash Path if attn_mask is None.
+                if attn_mask == "None" {
+                    let scale_val = if scale == "None" {
+                        format!("1.0 / ({}.dim(candle_core::D::Minus1)? as f32).sqrt()", q)
+                    } else {
+                        // scale is "Some(val)" -> need to extract val?
+                        // Actually scale variable is `Some(0.125)` string.
+                        // We need just the value.
+                        // But `scale` variable defined above was: `map(|f| format!("Some({})", f))`
+                        // So it is "Some(0.5)". We can't easily extract 0.5 without parsing string again.
+                        // Let's re-parse kwargs to get raw float if possible.
+                        let s = kwargs.get("scale").and_then(|v| v.as_f64());
+                        if let Some(s_val) = s {
+                            format!("{:.6}", s_val)
+                        } else {
+                            // Dynamic scale variable?
+                            // If it's None in kwargs, it defaults using q dim.
+                            format!("1.0 / ({}.dim(candle_core::D::Minus1)? as f32).sqrt()", q)
+                        }
+                    };
+
+                    (
+                        format!(
+                            "{{
+    #[cfg(feature = \"flash-attn\")]
+    {{
+        candle_flash_attn::flash_attn(&{}, &{}, &{}, {} as f32, {})?
+    }}
+    #[cfg(not(feature = \"flash-attn\"))]
+    {{
+        pycandle_core::ops::scaled_dot_product_attention(&{}, &{}, &{}, {}, {:.1}, {}, {})?
+    }}
+}}",
+                            q,
+                            k,
+                            v,
+                            scale_val,
+                            is_causal,
+                            q,
+                            k,
+                            v,
+                            attn_mask,
+                            dropout_p,
+                            is_causal,
+                            scale
+                        ),
+                        ReturnType::Tensor,
+                    )
+                } else {
+                    (
+                        format!(
+                            "pycandle_core::ops::scaled_dot_product_attention(&{}, &{}, &{}, {}, {:.1}, {}, {})?",
+                            q, k, v, attn_mask, dropout_p, is_causal, scale
+                        ),
+                        ReturnType::Tensor,
+                    )
+                }
             }
             // FEATURE: builtins.getattr
             "builtins.getattr" => {
@@ -571,6 +623,16 @@ impl super::Codegen {
                 )
             }
 
+            "torch.einsum" | "einsum" => {
+                let equation = args[0].trim_matches('"');
+                let input_args = if args.len() > 1 {
+                    args[1..].to_vec()
+                } else {
+                    vec![]
+                };
+                super::einsum::compile_einsum(equation, &input_args)
+            }
+
             "operator.getitem" | "_operator.getitem" => {
                 let idx = &args[1];
 
@@ -716,7 +778,7 @@ impl super::Codegen {
                     }
 
                     return (
-                        format!("{}.broadcast_add(&{})?", args[0], args[1]),
+                        format!("pycandle_core::ops::add(&{}, &{})?", args[0], args[1]),
                         ReturnType::Tensor,
                     );
                 }
@@ -760,7 +822,7 @@ impl super::Codegen {
                         return (expr, ReturnType::Tensor);
                     }
                     return (
-                        format!("{}.broadcast_sub(&{})?", args[0], args[1]),
+                        format!("pycandle_core::ops::sub(&{}, &{})?", args[0], args[1]),
                         ReturnType::Tensor,
                     );
                 }
@@ -801,7 +863,59 @@ impl super::Codegen {
                         );
                     }
                     return (
-                        format!("{}.broadcast_mul(&{})?", args[0], args[1]),
+                        format!("pycandle_core::ops::mul(&{}, &{})?", args[0], args[1]),
+                        ReturnType::Tensor,
+                    );
+                }
+                if target_lower.contains("div") && args.len() >= 2 {
+                    let type0 = _raw_args
+                        .get(0)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| node_types.get(s))
+                        .copied()
+                        .unwrap_or(ReturnType::Tensor);
+                    let type1 = _raw_args
+                        .get(1)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| node_types.get(s))
+                        .copied()
+                        .unwrap_or(ReturnType::Tensor);
+
+                    if type0 == ReturnType::Primitive || type1 == ReturnType::Primitive {
+                        return (
+                            format!("({} / {})", args[0], args[1]),
+                            ReturnType::Primitive,
+                        );
+                    }
+
+                    let is_scalar_0 = args[0].parse::<f64>().is_ok();
+                    let is_scalar_1 = args[1].parse::<f64>().is_ok();
+                    if is_scalar_0 || is_scalar_1 {
+                        let scalar = if is_scalar_0 { &args[0] } else { &args[1] };
+                        let tensor = if is_scalar_0 { &args[1] } else { &args[0] };
+
+                        let mut s_val = scalar.clone();
+                        if !s_val.contains('.') && !s_val.contains('e') {
+                            s_val.push_str(".0");
+                        }
+
+                        if is_scalar_0 {
+                            // scalar / tensor -> tensor.recip() * scalar ?
+                            // or tensor.pow(-1) * scalar
+                            return (
+                                format!("({}f64 * {}.powf(-1.0)?)", s_val, tensor),
+                                ReturnType::Tensor,
+                            );
+                        } else {
+                            // tensor / scalar -> tensor * (1/scalar)
+                            return (
+                                format!("{}.affine(1.0 / {}f64, 0.0)?", tensor, s_val),
+                                ReturnType::Tensor,
+                            );
+                        }
+                    }
+                    return (
+                        format!("pycandle_core::ops::div(&{}, &{})?", args[0], args[1]),
                         ReturnType::Tensor,
                     );
                 }
@@ -1242,6 +1356,7 @@ impl super::Codegen {
             let parts: Vec<&str> = content.split(',').map(|s| s.trim()).collect();
             let start = parts.get(0).copied().unwrap_or("None");
             let stop = parts.get(1).copied().unwrap_or("None");
+            let step = parts.get(2).copied().unwrap_or("1");
 
             let start_s = if start == "None" {
                 "None".to_string()
@@ -1253,6 +1368,13 @@ impl super::Codegen {
             } else {
                 format!("Some({})", stop)
             };
+
+            if step != "None" && step != "1" {
+                return format!(
+                    "pycandle_core::ops::IndexItem::StridedSlice({}, {}, {})",
+                    start_s, stop_s, step
+                );
+            }
 
             return format!(
                 "pycandle_core::ops::IndexItem::Slice({}, {})",

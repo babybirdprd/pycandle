@@ -1,5 +1,5 @@
 use candle_core::{Device, Tensor};
-use pycandle_core::{LayerMeta, PyChecker, VerificationMode};
+use pycandle_core::{PyChecker, VerificationMode};
 use std::collections::HashMap;
 
 #[test]

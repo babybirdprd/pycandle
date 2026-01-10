@@ -182,9 +182,20 @@ class GoldenRecorder:
                         self.records[f"{trace_key}.out.{i}"] = cpu_x
 
             # Record Metadata
+            module_type = type(m).__name__
+            supported_ops = {
+                "Linear", "Conv1d", "Conv2d", "LayerNorm", "Embedding", "ReLU", "GELU", 
+                "Sigmoid", "Tanh", "ELU", "LeakyReLU", "Snake", "BatchNorm1d", "BatchNorm2d",
+                "LSTM", "CausalConv1d", "Mish", "SiLU", "NewGELUActivation", "Dropout",
+                "Transpose", "SinusoidalPosEmb", "LlamaRMSNorm", "ModuleList", "Sequential"
+            }
+            if module_type not in supported_ops:
+                print(f"⚠️  WARNING: Custom or potentially unsupported Op detected: {module_type} ({name})")
+                print(f"    PyCandle might not support this layer automatically. You may need to implement a custom kernel.")
+
             self.manifest[trace_key] = LayerMeta(
                 name=name,
-                module_type=type(m).__name__,
+                module_type=module_type,
                 input_shapes=self._extract_shapes(inp),
                 output_shapes=self._extract_shapes(out),
                 parameters=[n for n, _ in m.named_parameters(recurse=False)],
@@ -304,6 +315,14 @@ class GoldenRecorder:
         if use_fx and hasattr(self, '_fx_graph'):
             manifest_data["_graph_nodes"] = self._fx_graph["graph_nodes"]
             manifest_data["_graph_code"] = self._fx_graph["graph_code"]
+            
+            # Auto-detect stateful
+            for node in self._fx_graph["graph_nodes"]:
+                if node["op"] == "placeholder" and (
+                    "past" in node["name"] or "cache" in node["name"]
+                ):
+                    manifest_data["_auto_stateful"] = True
+
 
         if hints:
             manifest_data["_symbolic_hints"] = hints

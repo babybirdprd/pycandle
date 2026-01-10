@@ -13,6 +13,24 @@ impl super::Codegen {
         code.push_str(&self.generate_config_struct());
         code.push_str("\n");
 
+        if self.stateful {
+            code.push_str(
+                "#[derive(Debug, Clone)]
+pub struct Cache {
+    pub use_cache: bool,
+    pub kv: Vec<Option<(Tensor, Tensor)>>,
+    pub offset: usize,
+}
+
+impl Cache {
+    pub fn new(use_cache: bool) -> Self {
+       Self { use_cache, kv: Vec::new(), offset: 0 }
+    }
+}
+\n",
+            );
+        }
+
         // Generate Model struct
         code.push_str(&self.generate_struct(model_name));
         code.push_str("\n");
@@ -71,7 +89,15 @@ impl super::Codegen {
         code.push_str(&format!("impl {} {{\n", model_name));
 
         // Load method
-        code.push_str("    pub fn load(vb: VarBuilder, config: Config) -> Result<Self> {\n");
+        code.push_str("    pub fn load_from_hub(repo: &str, revision: &str, device: &Device, config: Config) -> Result<Self> {
+        let api = hf_hub::api::sync::Api::new()?;
+        let repo = api.model(repo.to_string()).with_revision(revision.to_string());
+        let path = repo.get(\"model.safetensors\")?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], device.clone())? };
+        Self::load(vb, config)
+    }
+
+    pub fn load(vb: VarBuilder, config: Config) -> Result<Self> {\n");
         code.push_str("        Ok(Self {\n");
 
         let mut names: Vec<_> = self.manifest.keys().collect();
@@ -89,9 +115,14 @@ impl super::Codegen {
 
         // Forward method
         let ret_type = self.get_forward_return_type();
+        let forward_args = if self.stateful {
+            "&self, xs: &Tensor, cache: &mut Cache"
+        } else {
+            "&self, xs: &Tensor"
+        };
         code.push_str(&format!(
-            "    pub fn forward(&self, xs: &Tensor) -> {} {{\n",
-            ret_type
+            "    pub fn forward({}) -> {} {{\n",
+            forward_args, ret_type
         ));
 
         if !self.graph_nodes.is_empty() {
@@ -103,7 +134,15 @@ impl super::Codegen {
 
             for name in names {
                 let sanitized = self.sanitize_name(name);
-                code.push_str(&format!("        x = self.{}.forward(&x)?;\n", sanitized));
+                if self.stateful {
+                    // Check if module accepts cache?
+                    // For now, assume simple sequential models don't need cache unless explicit block?
+                    // But if we are stateful, maybe we pass it?
+                    // This is heuristic.
+                    code.push_str(&format!("        x = self.{}.forward(&x)?;\n", sanitized));
+                } else {
+                    code.push_str(&format!("        x = self.{}.forward(&x)?;\n", sanitized));
+                }
             }
             code.push_str("        Ok(x)\n");
         }
@@ -199,6 +238,28 @@ impl super::Codegen {
                 };
 
                 node_types.insert(node.name.clone(), ret);
+
+                // Auto-Contiguous Heuristic
+                // If this op was permute/transpose, mark it
+                if node.target == "permute" || node.target == "transpose" || node.target == "t" {
+                    self.permuted_vars.borrow_mut().insert(sanitized.clone());
+                }
+
+                // If this op is view/reshape, and input was permuted, inject .contiguous()
+                if (node.target == "view" || node.target == "reshape") && !args.is_empty() {
+                    if let Some(arg0) = args.get(0) {
+                        // Check if arg0 (the variable name) is in our permuted set
+                        // We need to resolve it back to the sanitized name
+                        if self.permuted_vars.borrow().contains(arg0) {
+                            // We can't change the generated code of the previous line easily here
+                            // But we can check if the generated expr for THIS line starts with arg0
+                            // Actually, map_fx_method generates "{}.view(...)", so we can just inject it there?
+                            // No, map_fx_method is called above.
+                            // Better: In map_fx_method, check if self_var is in permuted_vars.
+                        }
+                    }
+                }
+
                 code.push_str(&format!("        let {} = {};\n", sanitized, expr));
                 var_map.insert(node.name.clone(), sanitized);
             } else if node.op == "output" {

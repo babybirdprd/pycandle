@@ -1,7 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use candle_core::{Device, Tensor};
-    use pycandle_core::{ComparisonResult, PyChecker};
 
     // Mock PyChecker just to access log_result (which we can't easily do without full setup)
     // Actually, we can just use PyChecker if we mock the files, but easier to just implement a similar test

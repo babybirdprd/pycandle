@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 pub struct TestGenerator {
     model_name: String,
-    crate_name: String,
+    _crate_name: String,
     manifest: HashMap<String, LayerMeta>,
     graph_nodes: Vec<GraphNode>,
     project_name: String,
@@ -40,7 +40,7 @@ impl TestGenerator {
 
         Ok(Self {
             model_name,
-            crate_name: Self::detect_crate_name().unwrap_or_else(|_| "my_project".to_string()),
+            _crate_name: Self::detect_crate_name().unwrap_or_else(|_| "my_project".to_string()),
             manifest,
             graph_nodes,
             project_name,

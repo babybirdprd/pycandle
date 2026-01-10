@@ -29,7 +29,6 @@ struct App {
     test_results: Vec<TestResult>,
     parity_results: HashMap<String, ComparisonResult>,
     output_log: Vec<String>,
-    running: bool,
     scroll: usize,
     passed: usize,
     failed: usize,
@@ -39,11 +38,9 @@ struct App {
 struct TestResult {
     name: String,
     status: TestStatus,
-    details: String,
 }
 
 enum TestStatus {
-    Running,
     Passed,
     Failed,
 }
@@ -54,7 +51,6 @@ impl App {
             test_results: Vec::new(),
             parity_results: HashMap::new(),
             output_log: Vec::new(),
-            running: true,
             scroll: 0,
             passed: 0,
             failed: 0,
@@ -91,7 +87,6 @@ impl App {
             self.test_results.push(TestResult {
                 name,
                 status: TestStatus::Passed,
-                details: "".to_string(),
             });
             self.passed += 1;
             self.total += 1;
@@ -100,7 +95,6 @@ impl App {
             self.test_results.push(TestResult {
                 name,
                 status: TestStatus::Failed,
-                details: "".to_string(),
             });
             self.failed += 1;
             self.total += 1;
@@ -251,12 +245,10 @@ fn ui(f: &mut Frame, app: &mut App) {
             let style = match res.status {
                 TestStatus::Passed => Style::default().fg(Color::Green),
                 TestStatus::Failed => Style::default().fg(Color::Red),
-                TestStatus::Running => Style::default().fg(Color::Yellow),
             };
             let icon = match res.status {
                 TestStatus::Passed => "✔",
                 TestStatus::Failed => "✖",
-                TestStatus::Running => "⏳",
             };
 
             let prefix = if i == app.scroll { "> " } else { "  " };

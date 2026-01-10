@@ -115,10 +115,10 @@ pub fn run_init(_name: Option<String>) -> Result<()> {
             println!("   ⏳ Installing dependencies (torch, safetensors, transformers, onnx)...");
 
             // Determine python path (windows vs unix)
-            #[cfg(windows)]
-            let python_path = venv_dir.join("Scripts").join("python.exe");
-            #[cfg(not(windows))]
-            let python_path = venv_dir.join("bin").join("python");
+            // #[cfg(windows)]
+            // let python_path = venv_dir.join("Scripts").join("python.exe");
+            // #[cfg(not(windows))]
+            // let python_path = venv_dir.join("bin").join("python");
 
             // We can use `uv pip install` directly by pointing to the environment if we encourage that,
             // or just use the python binary to call pip? uv recommends `uv pip install --python <venv> ...`

@@ -2,8 +2,10 @@
 //!
 //! Command-line interface for PyTorch → Candle porting.
 
+mod bench_gen;
 mod dashboard;
 mod init;
+mod new;
 mod python_assets;
 mod report;
 mod test_gen;
@@ -104,6 +106,15 @@ enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
+    /// Create a new PyCandle project
+    New {
+        /// Project name
+        name: String,
+
+        /// Model architecture name (default: Model)
+        #[arg(short, long)]
+        model: Option<String>,
+    },
     /// Generate automated parity test
     GenTest {
         /// Name of the model struct (must match generated code)
@@ -130,6 +141,20 @@ enum Commands {
 
         /// Output directory for the manifest
         #[arg(short, long, default_value = "pycandle_trace")]
+        out: PathBuf,
+    },
+    /// Generate automated inference benchmark
+    GenBench {
+        /// Name of the model struct
+        #[arg(long, default_value = "Model")]
+        model: String,
+
+        /// Path to the manifest JSON file
+        #[arg(short, long)]
+        manifest: PathBuf,
+
+        /// Output path for the benchmark file
+        #[arg(short, long, default_value = "benches/inference.rs")]
         out: PathBuf,
     },
 }
@@ -239,9 +264,11 @@ fn main() -> Result<()> {
                     #[serde(rename = "_graph_nodes")]
                     graph_nodes: Option<Vec<pycandle_core::codegen::GraphNode>>,
                     #[serde(rename = "_graph_code")]
-                    graph_code: Option<String>,
+                    _graph_code: Option<String>,
                     #[serde(rename = "_symbolic_hints")]
                     symbolic_hints: Option<HashMap<String, usize>>,
+                    #[serde(rename = "_auto_stateful")]
+                    auto_stateful: Option<bool>,
                 }
 
                 let full_manifest: Manifest = serde_json::from_str(&manifest_content)
@@ -259,8 +286,15 @@ fn main() -> Result<()> {
                     })
                     .collect::<Result<_>>()?;
 
+                let is_stateful = stateful || full_manifest.auto_stateful.unwrap_or(false);
+                if is_stateful && !stateful {
+                    println!(
+                        "🧠 Auto-detected stateful model (KV-Cache detected). Enabling stateful generation."
+                    );
+                }
+
                 let mut generator =
-                    Codegen::new(layers, full_manifest.symbolic_hints).with_stateful(stateful);
+                    Codegen::new(layers, full_manifest.symbolic_hints).with_stateful(is_stateful);
                 if let Some(nodes) = full_manifest.graph_nodes {
                     generator = generator.with_graph(nodes);
                 }
@@ -459,6 +493,9 @@ fn main() -> Result<()> {
         Commands::Init { name } => {
             init::run_init(name)?;
         }
+        Commands::New { name, model } => {
+            new::run_new(name, model)?;
+        }
         Commands::GenTest {
             model,
             manifest,
@@ -505,6 +542,13 @@ fn main() -> Result<()> {
             } else {
                 eprintln!("❌ Conversion failed.");
             }
+        }
+        Commands::GenBench {
+            model,
+            manifest,
+            out,
+        } => {
+            bench_gen::generate_benchmark(&model, manifest, out)?;
         }
     }
 

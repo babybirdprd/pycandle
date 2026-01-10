@@ -162,6 +162,26 @@ pub fn gt(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
     lhs.gt(&rhs)
 }
 
+pub fn add(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+    let (lhs, rhs) = broadcast_v2(lhs, rhs)?;
+    lhs.add(&rhs)
+}
+
+pub fn sub(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+    let (lhs, rhs) = broadcast_v2(lhs, rhs)?;
+    lhs.sub(&rhs)
+}
+
+pub fn mul(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+    let (lhs, rhs) = broadcast_v2(lhs, rhs)?;
+    lhs.mul(&rhs)
+}
+
+pub fn div(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+    let (lhs, rhs) = broadcast_v2(lhs, rhs)?;
+    lhs.div(&rhs)
+}
+
 fn broadcast_v2(lhs: &Tensor, rhs: &Tensor) -> Result<(Tensor, Tensor)> {
     let mut lhs_shape = lhs.dims().to_vec();
     let mut rhs_shape = rhs.dims().to_vec();
@@ -219,6 +239,8 @@ pub enum IndexItem {
     Slice(Option<isize>, Option<isize>),
     Index(isize),
     RangeFull,
+    // (start, stop, step)
+    StridedSlice(Option<isize>, Option<isize>, isize),
 }
 
 pub fn index(tensor: &Tensor, args: Vec<IndexItem>) -> Result<Tensor> {
@@ -259,6 +281,39 @@ pub fn index(tensor: &Tensor, args: Vec<IndexItem>) -> Result<Tensor> {
                 };
                 let len = stop_idx.saturating_sub(start_idx);
                 t = t.narrow(dim_idx, start_idx, len)?;
+                dim_idx += 1;
+            }
+            IndexItem::StridedSlice(start, stop, step) => {
+                let dim_len = t.dim(dim_idx)?;
+                let start_idx = match start {
+                    Some(s) => {
+                        if s < 0 {
+                            (dim_len as isize + s) as usize
+                        } else {
+                            s as usize
+                        }
+                    }
+                    None => 0,
+                };
+                let stop_idx = match stop {
+                    Some(s) => {
+                        if s < 0 {
+                            (dim_len as isize + s) as usize
+                        } else {
+                            s as usize
+                        }
+                    }
+                    None => dim_len,
+                };
+
+                // Candle doesn't support stride > 1 directly in slicing
+                // We must use index_select
+                let indices: Vec<u32> = (start_idx..stop_idx)
+                    .step_by(step as usize)
+                    .map(|x| x as u32)
+                    .collect();
+                let idx_tensor = Tensor::new(indices.as_slice(), t.device())?;
+                t = t.index_select(&idx_tensor, dim_idx)?;
                 dim_idx += 1;
             }
             IndexItem::Index(i) => {

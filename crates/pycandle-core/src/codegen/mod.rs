@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 pub mod analyzer;
 pub mod config;
+pub mod einsum;
 pub mod gpt2;
 pub mod ops;
 pub mod renderer;
@@ -16,6 +17,7 @@ pub struct Codegen {
     pub hints: Option<HashMap<String, usize>>,
     pub graph_nodes: Vec<GraphNode>,
     pub stateful: bool,
+    pub permuted_vars: std::cell::RefCell<std::collections::HashSet<String>>,
     config: SymbolicConfig,
 }
 
@@ -29,6 +31,7 @@ impl Codegen {
             hints: hints.clone(),
             graph_nodes: Vec::new(),
             stateful: false,
+            permuted_vars: std::cell::RefCell::new(std::collections::HashSet::new()),
             config: SymbolicConfig::default(),
         };
         slf.config = slf.extract_symbolic_config();
