@@ -1,5 +1,36 @@
 use candle_core::{Module, Result, Tensor};
 
+pub fn load_weight_norm_conv1d(
+    vb: candle_nn::VarBuilder,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+) -> Result<candle_nn::Conv1d> {
+    let weight_g = vb
+        .pp("parametrizations.weight.original0")
+        .get((out_channels, 1, 1), "weight_g")?;
+    let weight_v = vb
+        .pp("parametrizations.weight.original1")
+        .get((out_channels, in_channels, kernel_size), "weight_v")?;
+
+    // v * (g / ||v||)
+    // Norm along (1, 2) which are (in_channels, kernel_size)
+    let norm_v = weight_v.sqr()?.sum_keepdim((1, 2))?.sqrt()?;
+    let weight = weight_v.broadcast_mul(&weight_g.broadcast_div(&norm_v)?)?;
+
+    let bias = vb.get(out_channels, "bias").ok();
+
+    let config = candle_nn::Conv1dConfig {
+        stride,
+        padding,
+        ..Default::default()
+    };
+
+    Ok(candle_nn::Conv1d::new(weight, bias, config))
+}
+
 /// CausalConv1d: A 1D convolution with causal padding
 /// Ensures that output at time t only depends on inputs at time <= t
 pub struct CausalConv1d {

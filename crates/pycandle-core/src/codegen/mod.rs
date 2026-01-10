@@ -52,6 +52,18 @@ impl Codegen {
         self
     }
 
+    fn should_be_leaf(&self, module_type: &str) -> bool {
+        matches!(
+            module_type,
+            "Linear"
+                | "Conv1d"
+                | "Conv2d"
+                | "ConvTranspose1d"
+                | "ParametrizedConv1d"
+                | "ParametrizedLinear"
+        )
+    }
+
     pub fn build_module_tree(&self) -> ModuleNode {
         let mut root = std::collections::BTreeMap::new();
         for (name, meta) in &self.manifest {
@@ -104,7 +116,19 @@ impl Codegen {
 
         let key = parts[0];
         if parts.len() == 1 {
-            if !node.contains_key(key) {
+            let should_insert = if let Some(existing) = node.get(key) {
+                if let ModuleNode::Struct(_) = existing {
+                    // If we have a Struct but this new Leaf says it should be a Leaf (e.g. ParametrizedConv1d),
+                    // we overwrite the Struct (pruning children).
+                    self.should_be_leaf(&meta.module_type)
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
+
+            if should_insert {
                 node.insert(key.to_string(), ModuleNode::Leaf(meta));
             }
         } else {
@@ -112,7 +136,10 @@ impl Codegen {
                 .entry(key.to_string())
                 .or_insert_with(|| ModuleNode::Struct(std::collections::BTreeMap::new()));
 
-            if let ModuleNode::Leaf(_) = entry {
+            if let ModuleNode::Leaf(leaf_meta) = entry {
+                if self.should_be_leaf(&leaf_meta.module_type) {
+                    return; // Stop recursion for forced leaves
+                }
                 // Convert Leaf to Struct if we need to go deeper (Leaf was a container)
                 *entry = ModuleNode::Struct(std::collections::BTreeMap::new());
             }

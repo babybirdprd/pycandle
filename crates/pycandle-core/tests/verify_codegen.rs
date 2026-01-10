@@ -20,7 +20,16 @@ fn verify_s3gen_codegen() {
 
     let manifest: HashMap<String, LayerMeta> = serde_json::from_str(&content).unwrap();
 
-    let codegen = Codegen::new(manifest, None);
+    let graph_node = pycandle_core::codegen::GraphNode {
+        name: "test_call".to_string(),
+        op: "call_module".to_string(),
+        target: "flow.encoder.up_encoders.0".to_string(),
+        args: vec![serde_json::to_value("xs").unwrap()],
+        kwargs: HashMap::new(),
+        module_type: None,
+    };
+
+    let codegen = Codegen::new(manifest, None).with_graph(vec![graph_node]);
     let code = codegen.generate_model_rs("S3Gen");
 
     println!("Generated Code Preview (first 500 chars):");

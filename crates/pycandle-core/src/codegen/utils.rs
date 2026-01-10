@@ -98,7 +98,9 @@ impl super::Codegen {
         // Core types
         match py_type {
             "Linear" => "candle_nn::Linear".to_string(),
+            "ParametrizedLinear" => "candle_nn::Linear".to_string(),
             "Conv1d" => "candle_nn::Conv1d".to_string(),
+            "ParametrizedConv1d" => "candle_nn::Conv1d".to_string(),
             "LayerNorm" => "candle_nn::LayerNorm".to_string(),
             "Embedding" => "candle_nn::Embedding".to_string(),
             // Activations

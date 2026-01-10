@@ -168,10 +168,18 @@ impl Cache {
 
                 // 2. Generate Struct Definition
                 let mut struct_code = String::new();
+                let mut clean_struct_code = String::new(); // For hashing (no comments)
+
                 struct_code.push_str(&format!(
                     "#[derive(Clone, Debug)]\npub struct {} {{\n",
                     type_name
-                )); // Added Debug, Clone
+                ));
+
+                clean_struct_code.push_str(&format!(
+                    "#[derive(Clone, Debug)]\npub struct {} {{\n",
+                    type_name
+                ));
+
                 for (name, child) in children {
                     let field_name = self.sanitize_name(name);
                     let type_str = match child {
@@ -195,6 +203,7 @@ impl Cache {
                         }
                     };
 
+                    // Add comment to real code ONLY
                     if let ModuleNode::Leaf(meta) = child {
                         if !meta.input_shapes.is_empty() {
                             struct_code
@@ -202,17 +211,14 @@ impl Cache {
                         }
                     }
                     struct_code.push_str(&format!("    pub {}: {},\n", field_name, type_str));
+                    clean_struct_code.push_str(&format!("    pub {}: {},\n", field_name, type_str));
                 }
 
-                // Add Config to root? No, we'll handle config in load manually for now or just generic.
-                // If it's the root, we might want it.
-                // But deduplication breaks "Is Root" concept.
-                // Only the actual usage knows.
-                // We'll standardise: `load` takes `&Config` (except root wrapper which we'll handle outside).
-
                 struct_code.push_str("}\n\n");
+                clean_struct_code.push_str("}\n\n");
 
                 // 3. Generate Impl Load
+                // ... (impl_code generation is unchanged) ...
                 let mut impl_code = String::new();
                 impl_code.push_str(&format!("impl {} {{\n", type_name));
                 impl_code.push_str(
@@ -273,19 +279,8 @@ impl Cache {
                 impl_code.push_str("    }\n");
                 impl_code.push_str("}\n\n");
 
-                // 4. Compute Hash
-                // Note: We need to anonymize the struct name in the code before hashing?
-                // OR: We include the body, but wait, the body contains `child_types`.
-                // If child A and child B are identical, `child_types` will preserve that.
-                // The Type Name *inside* the struct definition must be generic for the hash?
-                // No, because the child type name IS the identifier.
-                // `Box<BlockA>` vs `Box<BlockB>`.
-                // If `BlockA` was deduplicated to `Block`, then `BlockB` also became `Block`.
-                // So the *content* is identical.
-                // BUT the `struct Name {` ... `impl Name` parts need to be normalized before hashing.
-                // Replace `type_name` with "SELF" for hashing.
-
-                let anon_struct_code = struct_code.replace(type_name, "SELF_STRUCT_NAME");
+                // 4. Compute Hash using CLEAN struct code
+                let anon_struct_code = clean_struct_code.replace(type_name, "SELF_STRUCT_NAME");
                 let anon_impl_code = impl_code.replace(type_name, "SELF_STRUCT_NAME");
 
                 let mut hasher = DefaultHasher::new();
@@ -519,6 +514,34 @@ impl Cache {
             .unwrap_or(false);
 
         match meta.module_type.as_str() {
+            "ParametrizedLinear" => {
+                let (in_f_val, out_f_val) = self.infer_linear_dims(meta);
+                let in_f = self.render_dim(in_f_val, "hidden_dim");
+                let out_f = self.render_dim(out_f_val, "");
+                let bias = meta.config["bias"].as_bool().unwrap_or(true);
+                format!(
+                    "pycandle_core::layers::load_weight_norm_linear(vb.pp(\"{}\"), {}, {}, {})?",
+                    layer_name, in_f, out_f, bias
+                )
+            }
+            "ParametrizedConv1d" => {
+                let in_c = self.render_dim(
+                    meta.config["in_channels"].as_u64().unwrap_or(0) as usize,
+                    "",
+                );
+                let out_c = self.render_dim(
+                    meta.config["out_channels"].as_u64().unwrap_or(0) as usize,
+                    "",
+                );
+                let k = meta.config["kernel_size"].as_u64().unwrap_or(0);
+                let s = meta.config["stride"].as_u64().unwrap_or(1);
+                let p = meta.config["padding"].as_u64().unwrap_or(0);
+
+                format!(
+                    "pycandle_core::layers::load_weight_norm_conv1d(vb.pp(\"{}\"), {}, {}, {}, {}, {})?",
+                    layer_name, in_c, out_c, k, s, p
+                )
+            }
             "Linear" | "LoRACompatibleLinear" | "Conv1D" => {
                 let (in_f_val, out_f_val) = self.infer_linear_dims(meta);
                 let in_f = self.render_dim(in_f_val, "hidden_dim");
