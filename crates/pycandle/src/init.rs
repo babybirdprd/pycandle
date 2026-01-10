@@ -82,7 +82,14 @@ pub fn run_init(name: Option<String>) -> Result<()> {
         println!("   {} Created recorder.py", "✅".green());
     }
 
-    // 2. Create tests directory and parity test if requested
+    // 2. Create .pycandle directory for generated code
+    let pycandle_dir = Path::new(".pycandle");
+    if !pycandle_dir.exists() {
+        fs::create_dir(pycandle_dir).ok();
+        println!("   {} Created .pycandle directory", "✅".green());
+    }
+
+    // 3. Create tests directory and parity test if requested
     let tests_dir = Path::new("tests");
     if !tests_dir.exists() {
         fs::create_dir(tests_dir).ok(); // failure ok, maybe we are not in root

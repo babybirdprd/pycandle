@@ -51,9 +51,9 @@ enum Commands {
         #[arg(short, long)]
         manifest: PathBuf,
 
-        /// Output path for the generated Rust file or directory
+        /// Output path for the generated Rust file or directory (defaults to .pycandle/generated_{model}.rs)
         #[arg(short, long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
 
         /// Name of the model struct to generate
         #[arg(long, default_value = "MyModel")]
@@ -292,14 +292,19 @@ fn main() -> Result<()> {
 
                 if !analyze_only {
                     // Determine output path
-                    let final_out = if out_path.is_dir() {
+                    let final_out = if let Some(path) = out_path.clone() {
+                        if path.is_dir() {
+                            let stem = manifest_path.file_stem().unwrap().to_str().unwrap();
+                            let name = stem.replace("_manifest", "");
+                            path.join(format!("generated_{}.rs", name))
+                        } else {
+                            path.clone()
+                        }
+                    } else {
+                        // Default to .pycandle/generated_{model}.rs
                         let stem = manifest_path.file_stem().unwrap().to_str().unwrap();
                         let name = stem.replace("_manifest", "");
-                        out_path.join(format!("generated_{}.rs", name))
-                    } else {
-                        // If multiple manifests but one output file, this is ambiguous/wrong unless overwriting.
-                        // We'll enforce directory output if input is directory.
-                        out_path.clone()
+                        PathBuf::from(".pycandle").join(format!("generated_{}.rs", name))
                     };
 
                     println!(

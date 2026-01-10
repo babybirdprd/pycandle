@@ -10,6 +10,7 @@
 
 mod checker;
 pub mod codegen;
+pub use codegen::{GraphNode, ReturnType};
 pub mod gpt2;
 pub mod layers;
 pub mod ops;

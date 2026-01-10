@@ -344,7 +344,10 @@ pub struct KVCache {
     }
 
     fn generate_config_struct(&self) -> String {
-        let mut lines = vec!["pub struct Config {".to_string()];
+        let mut lines = vec![
+            "#[derive(Debug, Clone, Copy, Default)]".to_string(),
+            "pub struct Config {".to_string(),
+        ];
         let mut dims: Vec<_> = self.config.dims.iter().collect();
         dims.sort_by_key(|(k, _)| *k);
 
@@ -616,6 +619,51 @@ pub struct KVCache {
                     var_map.insert(node.name.clone(), var_name.clone());
                     node_types.insert(node.name.clone(), return_type);
                 }
+                "get_attr" => {
+                    let target = node.target.as_str();
+                    let sanitized = self.sanitize_name(target);
+                    let var_name = self.sanitize_name(&node.name);
+
+                    // Check if this is a parameter of a known module
+                    let mut found = false;
+                    let parts: Vec<&str> = target.split('.').collect();
+                    for i in (0..parts.len()).rev() {
+                        let prefix = parts[0..i].join(".");
+                        let suffix = parts[i..].join(".");
+                        if self.manifest.contains_key(&prefix) {
+                            let module_name = self.sanitize_name(&prefix);
+                            match suffix.as_str() {
+                                "weight" => {
+                                    code.push_str(&format!(
+                                        "        let {} = self.{}.weight().clone();\n",
+                                        var_name, module_name
+                                    ));
+                                    found = true;
+                                    break;
+                                }
+                                "bias" => {
+                                    // Handle Option<Tensor> for bias
+                                    code.push_str(&format!(
+                                        "        let {} = self.{}.bias().unwrap().clone();\n",
+                                        var_name, module_name
+                                    ));
+                                    found = true;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    if !found {
+                        code.push_str(&format!(
+                            "        let {} = self.{}.clone();\n",
+                            var_name, sanitized
+                        ));
+                    }
+                    var_map.insert(node.name.clone(), var_name);
+                    node_types.insert(node.name.clone(), ReturnType::Tensor);
+                }
                 "call_function" => {
                     let var_name = self.sanitize_name(&node.name);
                     let mut resolved_args = Vec::new();
@@ -667,7 +715,21 @@ pub struct KVCache {
                     let out_var = if let Some(arg0) = node.args.get(0) {
                         match arg0 {
                             serde_json::Value::String(s) => {
-                                var_map.get(s).cloned().unwrap_or(s.clone())
+                                // Handle dictionary snippets like "{'last_hidden_state': view_290}"
+                                if s.contains("{") && s.contains("}") {
+                                    let values = self.extract_values_from_dict_string(s);
+                                    let items: Vec<String> = values
+                                        .iter()
+                                        .map(|v| var_map.get(v).cloned().unwrap_or(v.clone()))
+                                        .collect();
+                                    if items.len() == 1 {
+                                        items[0].clone()
+                                    } else {
+                                        format!("({})", items.join(", "))
+                                    }
+                                } else {
+                                    var_map.get(s).cloned().unwrap_or(s.clone())
+                                }
                             }
                             serde_json::Value::Array(arr) => {
                                 let items: Vec<String> = arr
@@ -675,6 +737,18 @@ pub struct KVCache {
                                     .map(|v| self.resolve_fx_arg(v, &var_map))
                                     .collect();
                                 format!("({})", items.join(", "))
+                            }
+                            serde_json::Value::Object(obj) => {
+                                // Extract values in order
+                                let items: Vec<String> = obj
+                                    .values()
+                                    .map(|v| self.resolve_fx_arg(v, &var_map))
+                                    .collect();
+                                if items.len() == 1 {
+                                    items[0].clone()
+                                } else {
+                                    format!("({})", items.join(", "))
+                                }
                             }
                             _ => {
                                 let first_p = placeholders.get(0).and_then(|p| var_map.get(p));
@@ -697,7 +771,29 @@ pub struct KVCache {
 
     fn resolve_fx_arg(&self, arg: &serde_json::Value, var_map: &HashMap<String, String>) -> String {
         match arg {
-            serde_json::Value::String(s) => var_map.get(s).cloned().unwrap_or(s.clone()),
+            serde_json::Value::String(s) => {
+                // If it's a variable in the local scope, use it
+                if let Some(v) = var_map.get(s) {
+                    return v.clone();
+                }
+
+                // If it's a parameter or buffer name (from manifest), prefix it with self.
+                // We sanitized the names for fields, so we need to match that.
+                // In generate_struct, we use self.sanitize_name(name).
+                if self.manifest.contains_key(s) {
+                    return format!("self.{}", self.sanitize_name(s));
+                }
+
+                // Some parameters might have been flattened/prefixed differently?
+                // Actually, let's try to find a match in the manifest keys
+                for key in self.manifest.keys() {
+                    if self.sanitize_name(key) == self.sanitize_name(s) {
+                        return format!("self.{}", self.sanitize_name(key));
+                    }
+                }
+
+                s.clone()
+            }
             serde_json::Value::Number(n) => n.to_string(), // Literal numbers
             serde_json::Value::Bool(b) => b.to_string(),   // Literal bools
             serde_json::Value::Array(arr) => {
@@ -705,7 +801,7 @@ pub struct KVCache {
                     .iter()
                     .map(|v| self.resolve_fx_arg(v, var_map))
                     .collect();
-                format!("&[{}]", items.join(", "))
+                format!("vec![{}]", items.join(", "))
             }
             _ => arg.to_string(),
         }
@@ -722,31 +818,8 @@ pub struct KVCache {
     ) -> (String, ReturnType) {
         let target_lower = target.to_lowercase();
 
-        // Common binary ops
-        if target_lower.contains("add") && args.len() >= 2 {
-            return (
-                format!("(&{} + &{})?", args[0], args[1]),
-                ReturnType::Tensor,
-            );
-        }
-        if target_lower.contains("sub") && args.len() >= 2 {
-            return (
-                format!("(&{} - &{})?", args[0], args[1]),
-                ReturnType::Tensor,
-            );
-        }
-        if target_lower.contains("mul") && args.len() >= 2 {
-            return (
-                format!("(&{} * &{})?", args[0], args[1]),
-                ReturnType::Tensor,
-            );
-        }
-        if (target_lower.contains("div") || target_lower.contains("truediv")) && args.len() >= 2 {
-            return (
-                format!("(&{} / &{})?", args[0], args[1]),
-                ReturnType::Tensor,
-            );
-        }
+        // Binary ops are now handled in the main match arm or further down
+        // to avoid duplicate blocks and allow for specific op handling like addmm.
 
         // Robust loose matching for tricky ops
         if target.ends_with("getitem") {
@@ -773,7 +846,7 @@ pub struct KVCache {
                     }
                 }
                 ReturnType::Vec => {
-                    // Vec indexing: x[0] or x[-1]
+                    // Vec indexing: x[0] or x[-1] or x[slice(...)]
                     if let Ok(i) = idx.parse::<isize>() {
                         if i < 0 {
                             let offset = i.abs();
@@ -784,6 +857,11 @@ pub struct KVCache {
                         } else {
                             return (format!("{}[{}].clone()", args[0], i), ReturnType::Primitive);
                         }
+                    } else if idx.contains("slice(") {
+                        // Handled by the generic slice parsing logic that we want to unify
+                        let slice_str = idx.clone();
+                        let (expr, ret) = self.parse_vec_slice(&args[0], &slice_str);
+                        return (expr, ret);
                     } else {
                         return (
                             format!("{}[{}].clone()", args[0], args[1]),
@@ -792,26 +870,44 @@ pub struct KVCache {
                     }
                 }
                 ReturnType::Tensor => {
-                    if idx.contains("slice(") || idx == "None" || idx.starts_with("&[") {
+                    if idx.contains("slice(")
+                        || idx == "None"
+                        || idx.starts_with("&[")
+                        || idx.starts_with("vec![")
+                    {
                         // Map to .i() for indexing/slicing
-                        let mut cleaned = idx.clone();
-                        if cleaned.starts_with("&[") {
-                            cleaned = cleaned[2..cleaned.len() - 1].to_string();
+                        let mut cleaned = idx.trim().to_string();
+                        loop {
+                            let start_len = cleaned.len();
+                            if cleaned.starts_with("(") && cleaned.ends_with(")") {
+                                cleaned = cleaned[1..cleaned.len() - 1].trim().to_string();
+                            }
+                            if cleaned.starts_with("&[") {
+                                cleaned = cleaned[2..cleaned.len() - 1].trim().to_string();
+                            }
+                            if cleaned.starts_with("vec![") {
+                                cleaned = cleaned[5..cleaned.len() - 1].trim().to_string();
+                            }
+                            if cleaned.len() == start_len {
+                                break;
+                            }
                         }
 
-                        let items: Vec<String> = cleaned
-                            .split(",")
+                        let items: Vec<String> = self
+                            .split_indices(&cleaned)
+                            .into_iter()
                             .enumerate()
                             .map(|(i, s)| self.parse_slice_item(s.trim(), &args[0], i))
                             .collect();
 
-                        let final_idx = if items.len() == 1 {
-                            items[0].clone()
-                        } else {
-                            format!("({})", items.join(", "))
-                        };
-
-                        return (format!("{}.i({})?", args[0], final_idx), ReturnType::Tensor);
+                        return (
+                            format!(
+                                "pycandle_core::ops::index(&{}, vec![{}])?",
+                                args[0],
+                                items.join(", ")
+                            ),
+                            ReturnType::Tensor,
+                        );
                     } else {
                         return (format!("{}.get({})?", args[0], args[1]), ReturnType::Tensor);
                     }
@@ -923,10 +1019,69 @@ pub struct KVCache {
             ),
             // FEATURE: Comparisons
             "torch.lt" | "lt" | "_operator.lt" => {
-                (format!("{}.lt(&{})?", args[0], args[1]), ReturnType::Tensor)
+                // Check types for primitive comparison
+                let type0 = node_types
+                    .get(&args[0])
+                    .copied()
+                    .unwrap_or(ReturnType::Tensor);
+                let type1 = node_types
+                    .get(&args[1])
+                    .copied()
+                    .unwrap_or(ReturnType::Tensor);
+
+                if type0 == ReturnType::Primitive || type1 == ReturnType::Primitive {
+                    (
+                        format!("({} < {})", args[0], args[1]),
+                        ReturnType::Primitive,
+                    )
+                } else {
+                    (format!("{}.lt(&{})?", args[0], args[1]), ReturnType::Tensor)
+                }
             }
             "torch.gt" | "gt" | "_operator.gt" => {
-                (format!("{}.gt(&{})?", args[0], args[1]), ReturnType::Tensor)
+                let type0 = node_types
+                    .get(&args[0])
+                    .copied()
+                    .unwrap_or(ReturnType::Tensor);
+                let type1 = node_types
+                    .get(&args[1])
+                    .copied()
+                    .unwrap_or(ReturnType::Tensor);
+
+                if type0 == ReturnType::Primitive || type1 == ReturnType::Primitive {
+                    (
+                        format!("({} > {})", args[0], args[1]),
+                        ReturnType::Primitive,
+                    )
+                } else {
+                    (format!("{}.gt(&{})?", args[0], args[1]), ReturnType::Tensor)
+                }
+            }
+            "slice" => {
+                let start = args.get(0).map(|s| s.as_str()).unwrap_or("None");
+                let stop = args.get(1).map(|s| s.as_str()).unwrap_or("None");
+                // Generating a temporary helper call that returns a Range
+                // This assumes `pycandle_core::ops::slice` exists or logic that handles it
+                // Actually, `to.i()` uses custom parsing of IndexOp.
+                // We should output a string that `parse_slice_item` understands OR standard Rust range syntax.
+                // But `to.i` takes valid Rust syntax.
+                // `slice(None.., None, None)` is what triggered error.
+                // Let's output valid Rust range if possible, or a custom struct?
+                // `to.i` implementation in candle doesn't support arbitrary `slice()` function.
+                // We need to map `slice(start, stop)` to `start..stop`
+
+                let start_s = if start == "None" {
+                    "".to_string()
+                } else {
+                    start.to_string()
+                };
+                let stop_s = if stop == "None" {
+                    "".to_string()
+                } else {
+                    stop.to_string()
+                };
+
+                (format!("{}..{}", start_s, stop_s), ReturnType::Primitive)
             }
             // FEATURE: SDPA
             "torch.nn.functional.scaled_dot_product_attention"
@@ -973,7 +1128,7 @@ pub struct KVCache {
 
                 (
                     format!(
-                        "pycandle_core::ops::scaled_dot_product_attention({}, {}, {}, {}, {:.1}, {}, {})?",
+                        "pycandle_core::ops::scaled_dot_product_attention(&{}, &{}, &{}, {}, {:.1}, {}, {})?",
                         q, k, v, attn_mask, dropout_p, is_causal, scale
                     ),
                     ReturnType::Tensor,
@@ -1105,17 +1260,20 @@ pub struct KVCache {
 
                 if args.len() == 1 {
                     (
-                        format!("Tensor::arange(0u32, {}, {})?", args[0], dev),
+                        format!("Tensor::arange(0i64, {} as i64, {})?", args[0], dev),
                         ReturnType::Tensor,
                     )
                 } else if args.len() >= 2 {
                     (
-                        format!("Tensor::arange({}, {}, {})?", args[0], args[1], dev),
+                        format!(
+                            "Tensor::arange({} as i64, {} as i64, {})?",
+                            args[0], args[1], dev
+                        ),
                         ReturnType::Tensor,
                     )
                 } else {
                     (
-                        "Tensor::arange(0u32, 1u32, Device::Cpu)?".to_string(),
+                        "Tensor::arange(0i64, 1i64, Device::Cpu)?".to_string(),
                         ReturnType::Tensor,
                     )
                 }
@@ -1149,6 +1307,27 @@ pub struct KVCache {
                     ReturnType::Tensor,
                 )
             }
+            "torch.masked_fill" | "masked_fill" => {
+                let tensor = &args[0];
+                let mask = &args[1];
+                let mut value = args[2].clone();
+                if !value.contains('.') && !value.contains('e') && value.parse::<f64>().is_ok() {
+                    value.push_str(".0");
+                }
+                // Force .0 if it looks optionally like an integer
+                if let Ok(_) = value.parse::<i64>() {
+                    if !value.contains('.') {
+                        value.push_str(".0");
+                    }
+                }
+                (
+                    format!(
+                        "pycandle_core::ops::masked_fill(&{}, &{}, {})?",
+                        tensor, mask, value
+                    ),
+                    ReturnType::Tensor,
+                )
+            }
 
             "operator.getitem" | "_operator.getitem" => {
                 let idx = &args[1];
@@ -1175,34 +1354,51 @@ pub struct KVCache {
                         }
                     }
                     ReturnType::Vec => {
-                        // Vec indexing: x[0]
+                        // Vec indexing: x[0] -> returns a single element (Primitive)
                         if let Ok(i) = idx.parse::<usize>() {
-                            (format!("{}[{}].clone()", args[0], i), ReturnType::Tensor)
+                            (format!("{}[{}].clone()", args[0], i), ReturnType::Primitive)
                         } else {
-                            (format!("{}.get({})?", args[0], args[1]), ReturnType::Tensor)
+                            (
+                                format!("{}.get({})?", args[0], args[1]),
+                                ReturnType::Primitive,
+                            )
                         }
                     }
                     ReturnType::Tensor => {
                         if idx.contains("slice(") || idx == "None" || idx.starts_with("&[") {
                             // Map to .i() for indexing/slicing
-                            let mut cleaned = idx.clone();
-                            if cleaned.starts_with("&[") {
-                                cleaned = cleaned[2..cleaned.len() - 1].to_string();
+                            let mut cleaned = idx.trim().to_string();
+                            loop {
+                                let start_len = cleaned.len();
+                                if cleaned.starts_with("(") && cleaned.ends_with(")") {
+                                    cleaned = cleaned[1..cleaned.len() - 1].trim().to_string();
+                                }
+                                if cleaned.starts_with("&[") {
+                                    cleaned = cleaned[2..cleaned.len() - 1].trim().to_string();
+                                }
+                                if cleaned.starts_with("vec![") {
+                                    cleaned = cleaned[5..cleaned.len() - 1].trim().to_string();
+                                }
+                                if cleaned.len() == start_len {
+                                    break;
+                                }
                             }
 
-                            let items: Vec<String> = cleaned
-                                .split(",")
+                            let items: Vec<String> = self
+                                .split_indices(&cleaned)
+                                .into_iter()
                                 .enumerate()
                                 .map(|(i, s)| self.parse_slice_item(s.trim(), &args[0], i))
                                 .collect();
 
-                            let final_idx = if items.len() == 1 {
-                                items[0].clone()
-                            } else {
-                                format!("({})", items.join(", "))
-                            };
-
-                            (format!("{}.i({})?", args[0], final_idx), ReturnType::Tensor)
+                            (
+                                format!(
+                                    "pycandle_core::ops::index(&{}, vec![{}])?",
+                                    args[0],
+                                    items.join(", ")
+                                ),
+                                ReturnType::Tensor,
+                            )
                         } else {
                             (format!("{}.get({})?", args[0], args[1]), ReturnType::Tensor)
                         }
@@ -1219,15 +1415,200 @@ pub struct KVCache {
             }
             _ => {
                 if target_lower.contains("add") && args.len() >= 2 {
+                    let type0 = _raw_args
+                        .get(0)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| node_types.get(s))
+                        .copied()
+                        .unwrap_or(ReturnType::Tensor);
+                    let type1 = _raw_args
+                        .get(1)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| node_types.get(s))
+                        .copied()
+                        .unwrap_or(ReturnType::Tensor);
+
+                    if type0 == ReturnType::Primitive || type1 == ReturnType::Primitive {
+                        let a0 = if args[0].parse::<i64>().is_ok() {
+                            format!("{}usize", args[0])
+                        } else {
+                            args[0].clone()
+                        };
+                        let a1 = if args[1].parse::<i64>().is_ok() {
+                            format!("{}usize", args[1])
+                        } else {
+                            args[1].clone()
+                        };
+                        return (format!("({} + {})", a0, a1), ReturnType::Primitive);
+                    }
+
+                    let is_scalar_0 = args[0].parse::<f64>().is_ok();
+                    let is_scalar_1 = args[1].parse::<f64>().is_ok();
+
+                    if is_scalar_0 || is_scalar_1 {
+                        let scalar = if is_scalar_0 { &args[0] } else { &args[1] };
+                        let tensor = if is_scalar_0 { &args[1] } else { &args[0] };
+
+                        let mut s_val = scalar.clone();
+                        if !s_val.contains('.') && !s_val.contains('e') {
+                            s_val.push_str(".0");
+                        }
+                        return (
+                            format!("{}.affine({}, 0.0)?", tensor, s_val),
+                            ReturnType::Tensor,
+                        );
+                    }
+
+                    if self.is_vec_op(&args[0], &args[1], node_types, var_map) {
+                        let mut arg0 = args[0].clone();
+                        if arg0.contains("-1") && arg0.starts_with("vec![") {
+                            arg0 = arg0.replace("-1", "-1isize");
+                        }
+                        return (
+                            format!(
+                                "{{ let mut v: Vec<isize> = {}.iter().map(|&x| x as isize).collect(); v.extend({}.iter().map(|&x| x as isize)); v }}",
+                                arg0, args[1]
+                            ),
+                            ReturnType::Vec,
+                        );
+                    }
+
                     return (
-                        format!("(&{} + &{})?", args[0], args[1]),
+                        format!("{}.broadcast_add(&{})?", args[0], args[1]),
                         ReturnType::Tensor,
                     );
                 }
-                // FEATURE: In-Place Operations
-                if target_lower.contains("add_") && args.len() >= 2 {
+                if target_lower.contains("sub") && args.len() >= 2 {
+                    let type0 = _raw_args
+                        .get(0)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| node_types.get(s))
+                        .copied()
+                        .unwrap_or(ReturnType::Tensor);
+                    let type1 = _raw_args
+                        .get(1)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| node_types.get(s))
+                        .copied()
+                        .unwrap_or(ReturnType::Tensor);
+
+                    if type0 == ReturnType::Primitive || type1 == ReturnType::Primitive {
+                        return (
+                            format!("({} - {})", args[0], args[1]),
+                            ReturnType::Primitive,
+                        );
+                    }
+
+                    let is_scalar_0 = args[0].parse::<f64>().is_ok();
+                    let is_scalar_1 = args[1].parse::<f64>().is_ok();
+                    if is_scalar_0 || is_scalar_1 {
+                        let scalar = if is_scalar_0 { &args[0] } else { &args[1] };
+                        let tensor = if is_scalar_0 { &args[1] } else { &args[0] };
+
+                        let mut s_val = scalar.clone();
+                        if !s_val.contains('.') && !s_val.contains('e') {
+                            s_val.push_str(".0");
+                        }
+
+                        let expr = if is_scalar_0 {
+                            format!("Ok({} - {})?", scalar, tensor)
+                        } else {
+                            format!("{}.affine(1.0f64, -{}f64)?", tensor, s_val)
+                        };
+                        return (expr, ReturnType::Tensor);
+                    }
                     return (
-                        format!("(&{} + &{})?", args[0], args[1]),
+                        format!("{}.broadcast_sub(&{})?", args[0], args[1]),
+                        ReturnType::Tensor,
+                    );
+                }
+                if target_lower.contains("mul") && args.len() >= 2 {
+                    let type0 = _raw_args
+                        .get(0)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| node_types.get(s))
+                        .copied()
+                        .unwrap_or(ReturnType::Tensor);
+                    let type1 = _raw_args
+                        .get(1)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| node_types.get(s))
+                        .copied()
+                        .unwrap_or(ReturnType::Tensor);
+
+                    if type0 == ReturnType::Primitive || type1 == ReturnType::Primitive {
+                        return (
+                            format!("({} * {})", args[0], args[1]),
+                            ReturnType::Primitive,
+                        );
+                    }
+
+                    let is_scalar_0 = args[0].parse::<f64>().is_ok();
+                    let is_scalar_1 = args[1].parse::<f64>().is_ok();
+                    if is_scalar_0 || is_scalar_1 {
+                        let scalar = if is_scalar_0 { &args[0] } else { &args[1] };
+                        let tensor = if is_scalar_0 { &args[1] } else { &args[0] };
+
+                        let mut s_val = scalar.clone();
+                        if !s_val.contains('.') && !s_val.contains('e') {
+                            s_val.push_str(".0");
+                        }
+                        return (
+                            format!("{}.affine({}f64, 0.0f64)?", tensor, s_val),
+                            ReturnType::Tensor,
+                        );
+                    }
+                    return (
+                        format!("{}.broadcast_mul(&{})?", args[0], args[1]),
+                        ReturnType::Tensor,
+                    );
+                }
+                if (target_lower.contains("div") || target_lower.contains("truediv"))
+                    && args.len() >= 2
+                {
+                    let type0 = _raw_args
+                        .get(0)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| node_types.get(s))
+                        .copied()
+                        .unwrap_or(ReturnType::Tensor);
+                    let type1 = _raw_args
+                        .get(1)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| node_types.get(s))
+                        .copied()
+                        .unwrap_or(ReturnType::Tensor);
+
+                    if type0 == ReturnType::Primitive || type1 == ReturnType::Primitive {
+                        return (
+                            format!("({} / {})", args[0], args[1]),
+                            ReturnType::Primitive,
+                        );
+                    }
+
+                    let is_scalar_0 = args[0].parse::<f64>().is_ok();
+                    let is_scalar_1 = args[1].parse::<f64>().is_ok();
+                    if is_scalar_0 || is_scalar_1 {
+                        if is_scalar_1 {
+                            if let Ok(v) = args[1].parse::<f64>() {
+                                let val = 1.0 / v;
+                                let mut s = format!("{}", val);
+                                if !s.contains('.') && !s.contains('e') {
+                                    s.push_str(".0");
+                                }
+                                return (
+                                    format!("{}.affine({}, 0.0f64)?", args[0], s),
+                                    ReturnType::Tensor,
+                                );
+                            }
+                        }
+                        return (
+                            format!("Ok({} / {})?", args[0], args[1]),
+                            ReturnType::Tensor,
+                        );
+                    }
+                    return (
+                        format!("{}.broadcast_div(&{})?", args[0], args[1]),
                         ReturnType::Tensor,
                     );
                 }
@@ -1246,59 +1627,90 @@ pub struct KVCache {
         }
     }
 
+    fn split_indices(&self, s: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0;
+        for c in s.chars() {
+            if c == ',' && depth == 0 {
+                parts.push(current.trim().to_string());
+                current = String::new();
+            } else {
+                if c == '(' || c == '[' || c == '{' {
+                    depth += 1;
+                } else if c == ')' || c == ']' || c == '}' {
+                    depth -= 1;
+                }
+                current.push(c);
+            }
+        }
+        if !current.is_empty() {
+            parts.push(current.trim().to_string());
+        }
+        parts
+    }
+
     fn parse_slice_item(&self, item: &str, tensor_name: &str, dim_idx: usize) -> String {
+        let item = item.trim();
         if item == "None" {
-            return "..".to_string();
+            return "pycandle_core::ops::IndexItem::None".to_string();
+        }
+        if item == ".." {
+            return "pycandle_core::ops::IndexItem::RangeFull".to_string();
         }
 
-        // Handle single negative index
+        // Handle slice(start, stop, step) or slice(start, stop)
+        // Aggressively strip slice() wrapper
+        let cleaned = if item.starts_with("slice(") && item.ends_with(")") {
+            &item[6..item.len() - 1]
+        } else {
+            item
+        };
+
+        let parts: Vec<&str> = cleaned.split(",").map(|s| s.trim()).collect();
+
+        if parts.len() >= 2 || item.starts_with("slice(") {
+            let start_str = parts.get(0).copied().unwrap_or("None");
+            let stop_str = parts.get(1).copied().unwrap_or("None");
+
+            // Cleanup python artifacts like 'None..'
+            let clean_start = start_str.trim_matches('.');
+            let clean_stop = stop_str.trim_matches('.');
+
+            let start = if let Ok(val) = clean_start.parse::<isize>() {
+                format!("Some({})", val)
+            } else if clean_start == "None" || clean_start == "" {
+                "None".to_string()
+            } else {
+                if start_str.contains("None") {
+                    "None".to_string()
+                } else {
+                    format!("Some({} as isize)", start_str)
+                }
+            };
+
+            let stop = if let Ok(val) = clean_stop.parse::<isize>() {
+                format!("Some({})", val)
+            } else if clean_stop == "None" || clean_stop == "" {
+                "None".to_string()
+            } else {
+                if stop_str.contains("None") {
+                    "None".to_string()
+                } else {
+                    format!("Some({} as isize)", stop_str)
+                }
+            };
+
+            return format!("pycandle_core::ops::IndexItem::Slice({}, {})", start, stop);
+        }
+
+        // Handle single index (positive or negative)
         if let Ok(val) = item.parse::<isize>() {
-            if val < 0 {
-                return format!("{}.dim({})? - {}", tensor_name, dim_idx, val.abs());
-            }
-            return item.to_string();
+            return format!("pycandle_core::ops::IndexItem::Index({})", val);
         }
 
-        if !item.contains("slice(") {
-            return item.to_string();
-        }
-
-        // Parse slice(start, stop, step)
-        let content = item
-            .strip_prefix("slice(")
-            .and_then(|s| s.strip_suffix(")"))
-            .unwrap_or(item);
-        let parts: Vec<&str> = content.split(",").map(|s| s.trim()).collect();
-
-        let start_str = parts.get(0).copied().unwrap_or("None");
-        let stop_str = parts.get(1).copied().unwrap_or("None");
-
-        let start = if let Ok(val) = start_str.parse::<isize>() {
-            if val < 0 {
-                format!("{}.dim({})? - {}", tensor_name, dim_idx, val.abs())
-            } else {
-                start_str.to_string()
-            }
-        } else {
-            start_str.to_string()
-        };
-
-        let stop = if let Ok(val) = stop_str.parse::<isize>() {
-            if val < 0 {
-                format!("{}.dim({})? - {}", tensor_name, dim_idx, val.abs())
-            } else {
-                stop_str.to_string()
-            }
-        } else {
-            stop_str.to_string()
-        };
-
-        match (start.as_str(), stop.as_str()) {
-            ("None", "None") => "..".to_string(),
-            ("None", stop) => format!("..{}", stop),
-            (start, "None") => format!("{}..", start),
-            (start, stop) => format!("{}..{}", start, stop),
-        }
+        // Variable index
+        format!("pycandle_core::ops::IndexItem::Index({} as isize)", item)
     }
 
     fn map_fx_method(
@@ -1316,14 +1728,73 @@ pub struct KVCache {
 
         match method {
             "view" | "reshape" => {
-                if args.len() == 1 && args[0].starts_with("&[") {
+                let mapped_args: Vec<String> = args
+                    .iter()
+                    .map(|s| {
+                        if s == "-1" {
+                            "-1isize".to_string()
+                        } else if s.parse::<i64>().is_ok() {
+                            format!("{}isize", s)
+                        } else {
+                            format!("{} as isize", s)
+                        }
+                    })
+                    .collect();
+
+                // Check if we have a single argument that is already a Vec
+                let is_single_vec = if args.len() == 1 {
+                    let arg_name = args[0].trim();
+                    // We need to find the original FX name to check node_types
+                    let fx_name = node_types.keys().find(|k| {
+                        let sanitized = k.replace(".", "_");
+                        sanitized == arg_name || k.as_str() == arg_name
+                    });
+                    fx_name
+                        .and_then(|k| node_types.get(k))
+                        .map(|t| *t == ReturnType::Vec)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+
+                if is_single_vec {
                     (
-                        format!("{}.reshape({})?", self_var, args[0]),
+                        format!(
+                            "pycandle_core::ops::reshape(&{}, &{}.iter().map(|&x| x as isize).collect::<Vec<_>>())?",
+                            self_var, args[0]
+                        ),
+                        ReturnType::Tensor,
+                    )
+                } else if args.len() == 1 && args[0].starts_with("vec![") {
+                    (
+                        format!("pycandle_core::ops::reshape(&{}, &{})?", self_var, args[0]),
+                        ReturnType::Tensor,
+                    )
+                } else if args.len() == 1
+                    && node_types
+                        .get(&args[0])
+                        .map(|t| *t == ReturnType::Vec)
+                        .unwrap_or(false)
+                {
+                    (
+                        format!(
+                            "pycandle_core::ops::reshape(&{}, &{}.iter().map(|&x| x as isize).collect::<Vec<_>>())?",
+                            self_var, args[0]
+                        ),
+                        ReturnType::Tensor,
+                    )
+                } else if args.len() == 1 && args[0].starts_with("&[") {
+                    (
+                        format!("pycandle_core::ops::reshape(&{}, &{})?", self_var, args[0]),
                         ReturnType::Tensor,
                     )
                 } else {
                     (
-                        format!("{}.reshape(vec![{}])?", self_var, args.join(", ")),
+                        format!(
+                            "pycandle_core::ops::reshape(&{}, &vec![{}])?",
+                            self_var,
+                            mapped_args.join(", ")
+                        ),
                         ReturnType::Tensor,
                     )
                 }
@@ -1395,10 +1866,12 @@ pub struct KVCache {
                 )
             }
             "split" => {
-                let split_size = args.get(0).map(|s| s.as_str()).unwrap_or("1");
-                let dim = args.get(1).map(|s| s.as_str()).unwrap_or("1");
+                let dim = args.get(1).map(|s| s.as_str()).unwrap_or("0");
                 (
-                    format!("{}.split({}, {})?", self_var, split_size, dim),
+                    format!(
+                        "pycandle_core::ops::split(&{}, {} as usize, {} as usize)?",
+                        self_var, args[0], dim
+                    ),
                     ReturnType::Vec,
                 )
             }
@@ -1409,8 +1882,11 @@ pub struct KVCache {
                     (format!("{}.dims().to_vec()", self_var), ReturnType::Vec)
                 } else {
                     (
-                        format!("{}.dim({})?", self_var, args[0]),
-                        ReturnType::Tensor,
+                        format!(
+                            "pycandle_core::ops::dim(&{}, {} as isize)?",
+                            self_var, args[0]
+                        ),
+                        ReturnType::Tensor, // Usually implicitly used as tensor/scalar logic upstream
                     )
                 }
             }
@@ -1432,14 +1908,46 @@ pub struct KVCache {
                 ReturnType::Tensor,
             ),
             // Comparisons
-            "lt" | "_operator.lt" => (
-                format!("{}.lt(&{})?", self_var, args[0]),
-                ReturnType::Tensor,
-            ),
-            "gt" | "_operator.gt" => (
-                format!("{}.gt(&{})?", self_var, args[0]),
-                ReturnType::Tensor,
-            ),
+            "lt" | "_operator.lt" => {
+                let self_type = node_types
+                    .get(self_var_name)
+                    .copied()
+                    .unwrap_or(ReturnType::Tensor);
+                // Also check arg type
+                let arg_is_int = args[0].parse::<i64>().is_ok() || args[0].parse::<usize>().is_ok();
+
+                if self_type == ReturnType::Primitive || arg_is_int {
+                    (
+                        format!("({} < {})", self_var, args[0]),
+                        ReturnType::Primitive,
+                    )
+                } else {
+                    (
+                        format!("{}.lt(&{})?", self_var, args[0]),
+                        ReturnType::Tensor,
+                    )
+                }
+            }
+            "gt" | "_operator.gt" => {
+                let self_type = node_types
+                    .get(self_var_name)
+                    .copied()
+                    .unwrap_or(ReturnType::Tensor);
+                // Also check arg type
+                let arg_is_int = args[0].parse::<i64>().is_ok() || args[0].parse::<usize>().is_ok();
+
+                if self_type == ReturnType::Primitive || arg_is_int {
+                    (
+                        format!("({} > {})", self_var, args[0]),
+                        ReturnType::Primitive,
+                    )
+                } else {
+                    (
+                        format!("{}.gt(&{})?", self_var, args[0]),
+                        ReturnType::Tensor,
+                    )
+                }
+            }
             // Ops
             "scaled_dot_product_attention" => (
                 // Naive mapping to a potential ops::sdpa or just a placeholder if not existing
@@ -1451,20 +1959,49 @@ pub struct KVCache {
                 // actually candle-nn has it? No.
                 // We'll emit a TODO but with the arguments.
                 format!(
-                    "todo!(\"scaled_dot_product_attention({}, {}, {}, ...)\")",
+                    "todo!(\"scaled_dot_product_attention(&{}, &{}, &{}, ...)\")",
                     args.get(0).unwrap_or(&"".to_string()),
                     args.get(1).unwrap_or(&"".to_string()),
                     args.get(2).unwrap_or(&"".to_string())
                 ),
                 ReturnType::Tensor,
             ),
-            "masked_fill_" => {
+            "addmm" | "aten.addmm" => {
+                // addmm(bias, a, b) -> (a @ b) + bias
+                if args.len() >= 3 {
+                    return (
+                        format!(
+                            "{}.matmul(&{})?.broadcast_add(&{})?",
+                            args[1], args[2], args[0]
+                        ),
+                        ReturnType::Tensor,
+                    );
+                }
+                (
+                    format!("todo!(/* addmm with {} args */)", args.len()),
+                    ReturnType::Tensor,
+                )
+            }
+            "masked_fill" | "masked_fill_" => {
                 // In-place masked_fill_: tensor.masked_fill_(mask, value)
                 // Candle out-of-place: tensor.masked_fill(mask, value)
                 let mask = &args[0];
-                let value = &args[1];
+                let mut value = args[1].clone();
+                if !value.contains('.') && !value.contains('e') && value.parse::<f64>().is_ok() {
+                    value.push_str(".0");
+                }
+                // Force .0 if it looks optionally like an integer
+                if let Ok(_) = value.parse::<i64>() {
+                    if !value.contains('.') {
+                        value.push_str(".0");
+                    }
+                }
+
                 (
-                    format!("{}.masked_fill(&{}, {})?", self_var, mask, value),
+                    format!(
+                        "pycandle_core::ops::masked_fill(&{}, &{}, {})?",
+                        self_var, mask, value
+                    ),
                     ReturnType::Tensor,
                 )
             }
@@ -1730,6 +2267,82 @@ pub struct KVCache {
         }
     }
 
+    fn is_vec_op(
+        &self,
+        a: &str,
+        b: &str,
+        node_types: &HashMap<String, ReturnType>,
+        var_map: &HashMap<String, String>,
+    ) -> bool {
+        let a_name = var_map
+            .iter()
+            .find(|(_, v)| *v == &a)
+            .map(|(k, _)| k.as_str())
+            .unwrap_or(a);
+        let b_name = var_map
+            .iter()
+            .find(|(_, v)| *v == &b)
+            .map(|(k, _)| k.as_str())
+            .unwrap_or(b);
+
+        let a_type = node_types
+            .get(a_name)
+            .cloned()
+            .unwrap_or(ReturnType::Tensor);
+        let b_type = node_types
+            .get(b_name)
+            .cloned()
+            .unwrap_or(ReturnType::Tensor);
+
+        a_type == ReturnType::Vec || b_type == ReturnType::Vec
+    }
+
+    fn parse_vec_slice(&self, vec_name: &str, slice_str: &str) -> (String, ReturnType) {
+        let content = slice_str
+            .strip_prefix("slice(")
+            .and_then(|s| s.strip_suffix(")"))
+            .unwrap_or(slice_str);
+        let parts: Vec<&str> = content.split(",").map(|s| s.trim()).collect();
+        let start = parts.get(0).copied().unwrap_or("None");
+        let stop = parts.get(1).copied().unwrap_or("None");
+
+        let start_str = if start == "None" {
+            "".to_string()
+        } else {
+            start.to_string()
+        };
+        let stop_str = if stop == "None" {
+            "".to_string()
+        } else {
+            if let Ok(v) = stop.parse::<isize>() {
+                if v < 0 {
+                    format!("{}.len() - {}", vec_name, v.abs())
+                } else {
+                    v.to_string()
+                }
+            } else {
+                stop.to_string()
+            }
+        };
+        (
+            format!("{}[{}..{}].to_vec()", vec_name, start_str, stop_str),
+            ReturnType::Vec,
+        )
+    }
+
+    fn extract_values_from_dict_string(&self, s: &str) -> Vec<String> {
+        // Simple extraction for "{'key': value, 'key2': value2}"
+        let mut values = Vec::new();
+        let content = s.trim_matches(|c| c == '{' || c == '}');
+        for part in content.split(',') {
+            if let Some(pos) = part.find(':') {
+                let val = part[pos + 1..].trim();
+                values.push(val.to_string());
+            }
+        }
+        values
+    }
+
     fn get_forward_return_type(&self) -> String {
         if !self.graph_nodes.is_empty() {
             for node in &self.graph_nodes {
@@ -1739,6 +2352,21 @@ pub struct KVCache {
                             if arr.len() > 1 {
                                 let tensors = vec!["Tensor"; arr.len()];
                                 return format!("Result<({})>", tensors.join(", "));
+                            }
+                        }
+                        if let Some(obj) = arg0.as_object() {
+                            if obj.len() > 1 {
+                                let tensors = vec!["Tensor"; obj.len()];
+                                return format!("Result<({})>", tensors.join(", "));
+                            }
+                        }
+                        if let Some(s) = arg0.as_str() {
+                            if s.contains("{") && s.contains("}") {
+                                let values = self.extract_values_from_dict_string(s);
+                                if values.len() > 1 {
+                                    let tensors = vec!["Tensor"; values.len()];
+                                    return format!("Result<({})>", tensors.join(", "));
+                                }
                             }
                         }
                     }

@@ -81,4 +81,134 @@ pub fn scaled_dot_product_attention(
     attn_probs.matmul(value)
 }
 
+pub fn dim(tensor: &Tensor, dim: isize) -> Result<usize> {
+    let ndim = tensor.dims().len();
+    let dim = if dim < 0 { ndim as isize + dim } else { dim };
+    if dim < 0 || dim >= ndim as isize {
+        candle_core::bail!(
+            "Dimension out of range: {} for shape {:?}",
+            dim,
+            tensor.shape()
+        );
+    }
+    Ok(tensor.dims()[dim as usize])
+}
+
+pub fn masked_fill(tensor: &Tensor, mask: &Tensor, value: f64) -> Result<Tensor> {
+    let on_true = Tensor::full(value, tensor.shape(), tensor.device())?.to_dtype(tensor.dtype())?;
+    mask.where_cond(&on_true, tensor)
+}
+
+pub fn reshape(tensor: &Tensor, shape: &[isize]) -> Result<Tensor> {
+    let mut dims = Vec::new();
+    let mut infer_idx = None;
+    let mut product = 1;
+    for (i, &d) in shape.iter().enumerate() {
+        if d == -1 {
+            if infer_idx.is_some() {
+                candle_core::bail!("Only one dimension can be inferred (-1)");
+            }
+            infer_idx = Some(i);
+            dims.push(0); // placeholder
+        } else {
+            dims.push(d as usize);
+            product *= d as usize;
+        }
+    }
+
+    if let Some(idx) = infer_idx {
+        let total = tensor.shape().elem_count();
+        if product == 0 {
+            candle_core::bail!("Cannot reshape with product 0");
+        }
+        if total % product != 0 {
+            candle_core::bail!(
+                "Cannot reshape tensor of size {} into shape {:?}",
+                total,
+                shape
+            );
+        }
+        dims[idx] = total / product;
+    }
+
+    tensor.reshape(&dims[..])
+}
+
+pub fn split(tensor: &Tensor, split_size: usize, dim: usize) -> Result<Vec<Tensor>> {
+    let dim_size = tensor.dim(dim)?;
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < dim_size {
+        let size = std::cmp::min(split_size, dim_size - start);
+        chunks.push(tensor.narrow(dim, start, size)?);
+        start += size;
+    }
+    Ok(chunks)
+}
+
+pub enum IndexItem {
+    None,
+    // (start, stop) - using Option for None/RangeFull logic.
+    // If stop is None, it means end of dim.
+    // If start is None, it means 0.
+    Slice(Option<isize>, Option<isize>),
+    Index(isize),
+    RangeFull,
+}
+
+pub fn index(tensor: &Tensor, args: Vec<IndexItem>) -> Result<Tensor> {
+    let mut t = tensor.clone();
+    let mut dim_idx = 0;
+
+    for item in args {
+        match item {
+            IndexItem::None => {
+                t = t.unsqueeze(dim_idx)?;
+                dim_idx += 1;
+            }
+            IndexItem::RangeFull => {
+                // Keep dimension, proceed to next
+                dim_idx += 1;
+            }
+            IndexItem::Slice(start, stop) => {
+                let dim_len = t.dim(dim_idx)?;
+                let start_idx = match start {
+                    Some(s) => {
+                        if s < 0 {
+                            (dim_len as isize + s) as usize
+                        } else {
+                            s as usize
+                        }
+                    }
+                    None => 0,
+                };
+                let stop_idx = match stop {
+                    Some(s) => {
+                        if s < 0 {
+                            (dim_len as isize + s) as usize
+                        } else {
+                            s as usize
+                        }
+                    }
+                    None => dim_len,
+                };
+                let len = stop_idx.saturating_sub(start_idx);
+                t = t.narrow(dim_idx, start_idx, len)?;
+                dim_idx += 1;
+            }
+            IndexItem::Index(i) => {
+                let dim_len = t.dim(dim_idx)?;
+                let idx = if i < 0 {
+                    (dim_len as isize + i) as usize
+                } else {
+                    i as usize
+                };
+                t = t.narrow(dim_idx, idx, 1)?.squeeze(dim_idx)?;
+                // Dimension removed, so dim_idx stays same (next dim slides in)
+            }
+        }
+    }
+    Ok(t)
+}
+
 use candle_core::D;
