@@ -182,49 +182,24 @@ impl MyModel {
 }
 ```
 
-## Supported Module Types
+## Extending PyCandle
 
-| PyTorch | Candle | Status |
-|---------|--------|--------|
-| `nn.Linear` | `candle_nn::linear` | ✅ Auto (with smart transpose) |
-| `nn.Conv1d` | `candle_nn::conv1d` | ✅ Auto |
-| `nn.Embedding` | `candle_nn::embedding` | ✅ Auto |
-| `nn.LayerNorm` | `candle_nn::layer_norm` | ✅ Auto |
-| `nn.BatchNorm1d` | `BatchNorm1d` | ✅ Auto |
-| `nn.BatchNorm2d` | `BatchNorm2d` | ✅ Auto |
-| `nn.LSTM` | `LSTM` | ✅ Auto |
-| `nn.ReLU/GELU/Sigmoid/Tanh` | Activations | ✅ Auto |
-| `nn.ELU/LeakyReLU` | Parameterized activations | ✅ Auto |
-| `Snake` (BigVGAN) | `Snake` | ✅ Auto |
-| Custom modules | - | ⚠️ TODO marker |
+Adding support for a new PyTorch module involves three main steps:
 
-## Workspace Structure
+### 1. Implement the layer in Rust
+Add the layer implementation to `crates/pycandle-core/src/layers/`. 
+- **Activations**: Add to [activations.rs](file:///d:/pycandle/crates/pycandle-core/src/layers/activations.rs)
+- **Normalization**: Add to [norm.rs](file:///d:/pycandle/crates/pycandle-core/src/layers/norm.rs)
+- **Specialized**: Create a new file or add to [special.rs](file:///d:/pycandle/crates/pycandle-core/src/layers/special.rs)
 
-```
-pycandle/
-├── Cargo.toml              # Workspace root
-├── crates/
-│   ├── pycandle/           # CLI binary
-│   │   └── src/main.rs
-│   ├── pycandle-core/      # Library (PyChecker, layers, codegen)
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── checker.rs
-│   │       ├── layers.rs
-│   │       └── codegen/
-│   └── pycandle-audio/     # Audio ops (STFT, padding)
-│       └── src/lib.rs
-└── py/
-    └── spy.py              # GoldenRecorder
-```
+### 2. Update Codegen Mapping
+Register the mapping from the PyTorch module name to your Rust implementation:
+- **Initialization**: Update `generate_init` in [renderer.rs](file:///d:/pycandle/crates/pycandle-core/src/codegen/renderer.rs).
+- **Type Mapping**: Update `map_type` in [utils.rs](file:///d:/pycandle/crates/pycandle-core/src/codegen/utils.rs).
+- **Verification**: Update `is_supported` in [utils.rs](file:///d:/pycandle/crates/pycandle-core/src/codegen/utils.rs).
 
-**Using as a library:**
-```toml
-[dependencies]
-pycandle-core = { git = "https://github.com/user/pycandle" }
-# Optional audio support:
-pycandle-audio = { git = "https://github.com/user/pycandle" }
-```
+### 3. Capture Metadata (Optional)
+If your layer requires special configuration (like `eps`, `alpha`, or custom attributes), update `_get_module_config` in [py/spy.py](file:///d:/pycandle/py/spy.py).
 
 ---
 
@@ -290,13 +265,6 @@ Eliminate manual test writing by generating the full Rust test harness:
 
 Refining the symbolic propagator for complex models:
 - **Hint System:** Allow users to provide a `hints.json` to resolve ambiguous dimensions (e.g., when `hidden_dim` and `context_length` are both 1024).
-- **Manual Overrides:** Use the Python `recorder.save(..., hints={"vocab_size": 50000})` to guide the codegen when heuristics fail.
-
-### 🧩 Multi-Input & Complex Slicing
-**Status:** Complete ✅
-
-- **Multi-Input Support:** Models with multiple placeholders (e.g., TTS models) correctly generate `forward(&self, xs0: &Tensor, xs1: &Tensor, ...)` signatures.
-- **Robust Slicing:** Improved handling of complex `torch.fx` slicing nodes, mapping `operator.getitem` to Candle's `.i()` with support for multi-dimensional ranges (e.g., `x.i((.., ..-1))?`).
 
 ### 📉 Quantization Parity (GGUF/AWQ)
 **Status:** Complete ✅
@@ -314,25 +282,17 @@ Extending the verification engine to quantized models:
 4.  **Diagnostics:** A visual report and Python debug scripts showing exactly where the "Math Leak" is happening.
 ---
 ### 🌐 Universal ONNX Transpilation
-**Status: Prototype (via `onnx2torch`) 🛠️**
+**Status:** Complete ✅
 
 - **Bridge Strategy:** Automatically converts ONNX models to PyTorch in-memory, then traces them with `torch.fx` to generate idiomatic Rust.
 - **CLI Integration:** `pycandle onnx-convert --onnx model.onnx --name my_model` handles the conversion pipeline automatically.
 - **Dynamic Shape Inference:** Automatically detects input dimensions from the ONNX graph definition, defaulting dynamic axes to `1`.
 
-### Technical Challenges to Watch For:
-1.  **The "Opset" Nightmare:** ONNX has many versions (Opsets). You’ll need to focus on the most common ones (Opset 17+).
-2.  **Naming Conventions:** ONNX often renames layers to generic IDs (like `node_1`, `node_2`). v1.1 will include a "Sanitizer" pass in `codegen/mod.rs` to keep generated Rust code readable.
-3.  **Complex Ops:** Some ONNX ops (like `EinsteinSum` or complex `Loop` nodes) are very hard to map to Candle.
+### 🛡️ Production Refactor (v1.0 God-Object Reduction)
+**Status:** Complete ✅
 
-### Should you do it?
-**Yes, but as an alternative input.** 
-Keep the `torch.fx` path as the "Primary" because it produces the most readable, idiomatic Rust code. Use ONNX as the "Emergency/Universal" path for when the original source code isn't available.
-
-**PyCandle would then be:**
-*   **Input:** PyTorch Code OR ONNX File.
-*   **Process:** Trace + Analyze + Codegen.
-*   **Output:** Verified, Production-Grade Rust.
+- **Modular Layers**: Split the giant `layers.rs` into specialized sub-modules ([activations.rs](file:///d:/pycandle/crates/pycandle-core/src/layers/activations.rs), [norm.rs](file:///d:/pycandle/crates/pycandle-core/src/layers/norm.rs), etc.).
+- **Codegen Separation**: Modularized the [codegen](file:///d:/pycandle/crates/pycandle-core/src/codegen/mod.rs) module into [types.rs](file:///d:/pycandle/crates/pycandle-core/src/codegen/types.rs), [ops.rs](file:///d:/pycandle/crates/pycandle-core/src/codegen/ops.rs), and [renderer.rs](file:///d:/pycandle/crates/pycandle-core/src/codegen/renderer.rs) for better maintainability.
 
 ---
 
