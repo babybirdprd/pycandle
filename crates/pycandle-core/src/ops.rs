@@ -332,3 +332,49 @@ pub fn index(tensor: &Tensor, args: Vec<IndexItem>) -> Result<Tensor> {
 }
 
 use candle_core::D;
+
+pub fn clamp(t: &Tensor, min: Option<f64>, max: Option<f64>) -> Result<Tensor> {
+    match (min, max) {
+        (Some(min), Some(max)) => t.clamp(min, max),
+        (Some(min), None) => t.clamp(min, f64::MAX),
+        (None, Some(max)) => t.clamp(f64::MIN, max),
+        (None, None) => Ok(t.clone()),
+    }
+}
+
+pub fn interpolate_nearest2d(t: &Tensor, size: (usize, usize)) -> Result<Tensor> {
+    // Basic nearest neighbor upsampling for 2D images (N, C, H, W)
+    // Candle doesn't have a native interpolate, so we use index_select
+    let (_n, _c, h, w) = t.dims4()?;
+    let (target_h, target_w) = size;
+
+    let h_scale = h as f32 / target_h as f32;
+    let w_scale = w as f32 / target_w as f32;
+
+    let h_indices = (0..target_h)
+        .map(|i| (i as f32 * h_scale) as u32)
+        .collect::<Vec<_>>();
+    let w_indices = (0..target_w)
+        .map(|i| (i as f32 * w_scale) as u32)
+        .collect::<Vec<_>>();
+
+    let h_idx = Tensor::new(h_indices, t.device())?;
+    let w_idx = Tensor::new(w_indices, t.device())?;
+
+    t.index_select(&h_idx, 2)?.index_select(&w_idx, 3)
+}
+
+pub fn gather(t: &Tensor, dim: isize, index: &Tensor) -> Result<Tensor> {
+    let dim = if dim < 0 {
+        t.rank() as isize + dim
+    } else {
+        dim
+    } as usize;
+    t.gather(index, dim)
+}
+
+pub fn where_cond(condition: &Tensor, on_true: &Tensor, on_false: &Tensor) -> Result<Tensor> {
+    // Ensure condition is broadcastable or exact match
+    // PyTorch broadcasts condition, Candle is stricter.
+    condition.where_cond(on_true, on_false)
+}

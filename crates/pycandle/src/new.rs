@@ -43,6 +43,7 @@ flash-attn = ["dep:candle-flash-attn"]
     // Create folder structure
     fs::create_dir_all(project_path.join("src"))?;
     fs::create_dir_all(project_path.join("py")).context("Failed to create py folder")?;
+    fs::create_dir_all(project_path.join(".github/workflows"))?;
 
     // Create src/main.rs
     let main_rs = r#"use clap::Parser;
@@ -152,6 +153,46 @@ run:
 .pycandle/tmp
 "#;
     fs::write(project_path.join(".gitignore"), gitignore)?;
+
+    // Create CI Workflow
+    let workflow = format!(
+        r#"name: Parity Check
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        pip install uv
+        uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+        uv pip install --system candle-core safetensors transformers accelerate
+
+    - name: Install PyCandle CLI
+      run: cargo install --git https://github.com/pycandle/pycandle pycandle
+
+    - name: Record Trace
+      run: pycandle record --script py/model.py --name {}
+
+    - name: Run Parity Tests
+      run: cargo test
+"#,
+        name
+    );
+    fs::write(project_path.join(".github/workflows/parity.yml"), workflow)?;
 
     println!("✅ Project ready at ./{}", name);
     println!("👉 To get started:");

@@ -1,13 +1,67 @@
 use super::gpt2;
 use crate::LayerMeta;
-use std::collections::HashMap;
+use regex::Regex;
+use std::collections::{HashMap, HashSet};
+
+struct GroupInfo {
+    _name: String,
+    count: usize,
+    module_type: String,
+}
 
 impl super::Codegen {
+    fn get_groups(&self) -> HashMap<String, GroupInfo> {
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut types: HashMap<String, String> = HashMap::new();
+        let re = Regex::new(r"^(.*)\.(\d+)$").unwrap();
+
+        for (name, meta) in &self.manifest {
+            if let Some(caps) = re.captures(name) {
+                let base = caps.get(1).unwrap().as_str().to_string();
+                let idx = caps.get(2).unwrap().as_str().parse::<usize>().unwrap();
+                groups.entry(base.clone()).or_default().push(idx);
+                types.insert(base, meta.module_type.clone());
+            }
+        }
+
+        let mut result = HashMap::new();
+        for (base, indices) in groups {
+            // Only group if we have at least 2 items and they are roughly sequential
+            if indices.len() > 1 {
+                let max_idx = *indices.iter().max().unwrap();
+                if max_idx == indices.len() - 1 {
+                    result.insert(
+                        base.clone(),
+                        GroupInfo {
+                            _name: base.clone(),
+                            count: indices.len(),
+                            module_type: types[&base].clone(),
+                        },
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    fn resolve_target(&self, target: &str, groups: &HashMap<String, GroupInfo>) -> String {
+        let re = Regex::new(r"^(.*)\.(\d+)$").unwrap();
+        if let Some(caps) = re.captures(target) {
+            let base = caps.get(1).unwrap().as_str();
+            let idx = caps.get(2).unwrap().as_str();
+            if groups.contains_key(base) {
+                return format!("{}[{}]", self.sanitize_name(base), idx);
+            }
+        }
+        self.sanitize_name(target)
+    }
+
     pub fn generate_model_rs(&self, model_name: &str) -> String {
         let mut code = String::new();
         code.push_str("use candle_core::{Result, Tensor, IndexOp, Shape, Device, DType};\n");
         code.push_str("use candle_nn::{VarBuilder, Module};\n");
-        code.push_str("use pycandle_core::layers::*;\n\n");
+        code.push_str("use pycandle_core::layers::*;\n");
+        code.push_str("use pycandle_core::weights;\n\n");
 
         // Generate Config struct
         code.push_str(&self.generate_config_struct());
@@ -66,14 +120,51 @@ impl Cache {
         let mut code = String::new();
         code.push_str(&format!("pub struct {} {{\n", model_name));
 
+        let groups = self.get_groups();
+        let mut handled_groups = HashSet::new();
+
         // Sort names for deterministic output
         let mut names: Vec<_> = self.manifest.keys().collect();
         names.sort();
 
         for name in names {
+            // Check if part of a group
+            let re = Regex::new(r"^(.*)\.(\d+)$").unwrap();
+            if let Some(caps) = re.captures(name) {
+                let base = caps.get(1).unwrap().as_str();
+                if let Some(info) = groups.get(base) {
+                    if handled_groups.contains(base) {
+                        continue;
+                    }
+                    // Generate Vector field
+                    let rust_type = self.map_type(&info.module_type);
+                    code.push_str(&format!("    /// Group: {} (x{})\n", base, info.count));
+                    code.push_str(&format!(
+                        "    pub {}: Vec<{}>,\n",
+                        self.sanitize_name(base),
+                        rust_type
+                    ));
+                    handled_groups.insert(base.to_string());
+                    continue;
+                }
+            }
+
             let meta = &self.manifest[name];
             let sanitized = self.sanitize_name(name);
             let rust_type = self.map_type(&meta.module_type);
+
+            // Docstring Injection
+            code.push_str(&format!("    /// Layer: {}\n", name));
+            if !meta.input_shapes.is_empty() {
+                code.push_str(&format!("    /// Input: {:?}\n", meta.input_shapes));
+            }
+            if !meta.parameters.is_empty() {
+                code.push_str(&format!(
+                    "    /// Params: {} tensors\n",
+                    meta.parameters.len()
+                ));
+            }
+
             code.push_str(&format!("    pub {}: {},\n", sanitized, rust_type));
         }
 
@@ -100,10 +191,55 @@ impl Cache {
     pub fn load(vb: VarBuilder, config: Config) -> Result<Self> {\n");
         code.push_str("        Ok(Self {\n");
 
+        let groups = self.get_groups();
+        let mut handled_groups = HashSet::new();
         let mut names: Vec<_> = self.manifest.keys().collect();
         names.sort();
 
         for name in names {
+            let re = Regex::new(r"^(.*)\.(\d+)$").unwrap();
+            if let Some(caps) = re.captures(name) {
+                let base = caps.get(1).unwrap().as_str();
+                if let Some(info) = groups.get(base) {
+                    if handled_groups.contains(base) {
+                        continue;
+                    }
+                    let sanitized = self.sanitize_name(base);
+                    // Vector Load Loop
+                    code.push_str(&format!(
+                        "            {}: (0..{}).map(|i| {{\n",
+                        sanitized, info.count
+                    ));
+                    // We need to generate init for one item to see the pattern, but with dynamic name
+                    // Hack: Generate init for base.0, then replace base.0 with key using regex or format
+                    // Better: The `generate_init` takes `layer_name`.
+                    // We can call `generate_init` with `format!(\"{}.{}\", base, i)`?
+                    // But `generate_init` looks up manifest. manifest needs real key.
+                    // We have real keys in manifest.
+                    // So inside the map loop, we can't easily call generate_init dynamic text unless we inline the logic.
+                    // Or we assume all items in group are identical types (they are) and use base.0 as template?
+                    // Yes, use base.0 as template, but replace "base.0" string in generated code with dynamic format.
+
+                    let template_key = format!("{}.0", base);
+                    let meta = &self.manifest[&template_key];
+                    let init_code = self.generate_init(&template_key, meta);
+
+                    // Replace "base.0" with "{}.{}", base, i in the logic?
+                    // generate_init generates `vb.pp("base.0")`.
+                    // We want `vb.pp(&format!("{}.{}", base, i))`.
+                    let fixed_init = init_code.replace(
+                        &format!("\"{}\"", template_key),
+                        &format!("&format!(\"{}.{{}}\", i)", base),
+                    );
+
+                    code.push_str(&format!("                {}\n", fixed_init));
+                    code.push_str("            }).collect::<Result<Vec<_>>>()?,\n");
+
+                    handled_groups.insert(base.to_string());
+                    continue;
+                }
+            }
+
             let meta = &self.manifest[name];
             let sanitized = self.sanitize_name(name);
             let init = self.generate_init(name, meta);
@@ -129,20 +265,32 @@ impl Cache {
             code.push_str(&self.generate_forward_dag(&self.graph_nodes));
         } else {
             code.push_str("        let mut x = xs.clone();\n");
+
+            // Sequential Strategy with Groups
+            let groups = self.get_groups(); // Re-compute or reuse? 
+            let mut handled_groups = HashSet::new();
             let mut names: Vec<_> = self.manifest.keys().collect();
             names.sort();
 
             for name in names {
-                let sanitized = self.sanitize_name(name);
-                if self.stateful {
-                    // Check if module accepts cache?
-                    // For now, assume simple sequential models don't need cache unless explicit block?
-                    // But if we are stateful, maybe we pass it?
-                    // This is heuristic.
-                    code.push_str(&format!("        x = self.{}.forward(&x)?;\n", sanitized));
-                } else {
-                    code.push_str(&format!("        x = self.{}.forward(&x)?;\n", sanitized));
+                let re = Regex::new(r"^(.*)\.(\d+)$").unwrap();
+                if let Some(caps) = re.captures(name) {
+                    let base = caps.get(1).unwrap().as_str();
+                    if let Some(_) = groups.get(base) {
+                        if handled_groups.contains(base) {
+                            continue;
+                        }
+                        let sanitized = self.sanitize_name(base);
+                        code.push_str(&format!("        for layer in &self.{} {{\n", sanitized));
+                        code.push_str("            x = layer.forward(&x)?;\n");
+                        code.push_str("        }\n");
+                        handled_groups.insert(base.to_string());
+                        continue;
+                    }
                 }
+
+                let sanitized = self.sanitize_name(name);
+                code.push_str(&format!("        x = self.{}.forward(&x)?;\n", sanitized));
             }
             code.push_str("        Ok(x)\n");
         }
@@ -189,7 +337,6 @@ impl Cache {
             let sanitized = self.sanitize_name(&node.name);
 
             if node.op == "call_module" {
-                let target_sanitized = self.sanitize_name(&node.target);
                 let args: Vec<String> = node
                     .args
                     .iter()
@@ -201,6 +348,10 @@ impl Cache {
                 } else {
                     format!("&{}", args[0])
                 };
+
+                // Groups resolution
+                let groups = self.get_groups();
+                let target_sanitized = self.resolve_target(&node.target, &groups);
 
                 code.push_str(&format!(
                     "        let {} = self.{}.forward({})?;\n",
@@ -336,13 +487,16 @@ impl Cache {
 
                 if needs_transpose {
                     format!(
-                        "{{ let w = vb.pp(\"{}\").get(({}, {}), \"weight\")?.t()?; \
+                        "{{ let w = weights::get_cast(&vb.pp(\"{}\"), ({}, {}), \"weight\")?.t()?; \
                          let b = {}; candle_nn::Linear::new(w, b) }}",
                         layer_name,
                         in_f,
                         out_f,
                         if bias {
-                            format!("Some(vb.pp(\"{}\").get({}, \"bias\")?)", layer_name, out_f)
+                            format!(
+                                "Some(weights::get_cast(&vb.pp(\"{}\"), {}, \"bias\")?)",
+                                layer_name, out_f
+                            )
                         } else {
                             "None".to_string()
                         }

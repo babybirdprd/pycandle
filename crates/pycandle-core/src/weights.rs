@@ -1,6 +1,23 @@
 use anyhow::{Context, Result};
+use candle_core::{Shape, Tensor};
+use candle_nn::VarBuilder;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+
+/// Auto-casts weights if they don't match the VarBuilder's dtype.
+/// This prevents panics when loading f16 weights into an f32 model or vice-versa.
+pub fn get_cast(
+    vb: &VarBuilder,
+    shape: impl Into<Shape>,
+    name: &str,
+) -> candle_core::Result<Tensor> {
+    let tensor = vb.get(shape, name)?;
+    if tensor.dtype() != vb.dtype() {
+        tensor.to_dtype(vb.dtype())
+    } else {
+        Ok(tensor)
+    }
+}
 
 /// A renaming engine for tensor keys using Regex patterns.
 pub struct WeightMapper {
