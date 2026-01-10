@@ -542,6 +542,46 @@ impl Cache {
                     layer_name, in_c, out_c, k, s, p
                 )
             }
+            "ParametrizedConvTranspose1d" => {
+                let in_c = self.render_dim(
+                    meta.config["in_channels"].as_u64().unwrap_or(0) as usize,
+                    "",
+                );
+                let out_c = self.render_dim(
+                    meta.config["out_channels"].as_u64().unwrap_or(0) as usize,
+                    "",
+                );
+                let k = meta.config["kernel_size"].as_u64().unwrap_or(0);
+                let s = meta.config["stride"].as_u64().unwrap_or(1);
+                let p = meta.config["padding"].as_u64().unwrap_or(0);
+
+                format!(
+                    "pycandle_core::layers::load_weight_norm_conv_transpose1d(vb.pp(\"{}\"), {}, {}, {}, {}, {})?",
+                    layer_name, in_c, out_c, k, s, p
+                )
+            }
+            "SineGen" => {
+                let harmonic_num = meta.config["harmonic_num"].as_u64().unwrap_or(0);
+                let sine_amp = meta.config["sine_amp"].as_f64().unwrap_or(0.1);
+                let noise_std = meta.config["noise_std"].as_f64().unwrap_or(0.003);
+                let sampling_rate = meta.config["sampling_rate"].as_f64().unwrap_or(24000.0);
+                let voiced_threshold = meta.config["voiced_threshold"].as_f64().unwrap_or(0.0);
+
+                // Assuming SineGen is in scope or fully qualified?
+                // `utils.rs` maps it to `SineGen` (assuming `use pycandle_core::layers::*` in generated code).
+                format!(
+                    "SineGen::new({}, {:?}, {:?}, {:?}, {:?})",
+                    harmonic_num, sine_amp, noise_std, sampling_rate, voiced_threshold
+                )
+            }
+            "Upsample" => {
+                let scale = meta.config["scale_factor"].as_u64().unwrap_or(1);
+                format!("Upsample::new({})", scale)
+            }
+            "ReflectionPad1d" => {
+                let p = meta.config["padding"].as_u64().unwrap_or(0);
+                format!("ReflectionPad1d::new({})", p)
+            }
             "Linear" | "LoRACompatibleLinear" | "Conv1D" => {
                 let (in_f_val, out_f_val) = self.infer_linear_dims(meta);
                 let in_f = self.render_dim(in_f_val, "hidden_dim");
@@ -760,25 +800,6 @@ impl Cache {
             "SinusoidalPosEmb" => {
                 let dim = meta.output_shapes[0][1];
                 format!("SinusoidalPosEmb::new({})", dim)
-            }
-            "Upsample" => {
-                let scale = meta.config["scale_factor"].as_u64().unwrap_or(1) as usize;
-                format!("Upsample::new({})", scale)
-            }
-            "ReflectionPad1d" => {
-                let p = meta.config["padding"].as_u64().unwrap_or(0) as usize;
-                format!("ReflectionPad1d::new({})", p)
-            }
-            "SineGen" => {
-                let harmonic_num = meta.config["harmonic_num"].as_u64().unwrap_or(0) as usize;
-                let sine_amp = meta.config["sine_amp"].as_f64().unwrap_or(0.1);
-                let noise_std = meta.config["noise_std"].as_f64().unwrap_or(0.003);
-                let sr = meta.config["sampling_rate"].as_f64().unwrap_or(24000.0);
-                let thresh = meta.config["voiced_threshold"].as_f64().unwrap_or(0.0);
-                format!(
-                    "SineGen::new({}, {:.6}, {:.6}, {:.1}, {:.1})",
-                    harmonic_num, sine_amp, noise_std, sr, thresh
-                )
             }
             _ => format!(
                 "todo!(\"Implement initialization for {}\")",

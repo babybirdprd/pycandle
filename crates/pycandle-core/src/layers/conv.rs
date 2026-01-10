@@ -31,6 +31,45 @@ pub fn load_weight_norm_conv1d(
     Ok(candle_nn::Conv1d::new(weight, bias, config))
 }
 
+pub fn load_weight_norm_conv_transpose1d(
+    vb: candle_nn::VarBuilder,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+) -> Result<candle_nn::ConvTranspose1d> {
+    let weight_g = vb
+        .pp("parametrizations.weight.original0")
+        .get((1, out_channels, 1), "weight_g")?;
+    let weight_v = vb
+        .pp("parametrizations.weight.original1")
+        .get((in_channels, out_channels, kernel_size), "weight_v")?;
+
+    // v * (g / ||v||)
+    // Norm along (0, 2) which are (in_channels, kernel_size) ?
+    // Weight shape for ConvTranspose1d is [in, out, k].
+    // Usually WeightNorm for ConvTranspose1d applies to the output channel dimension.
+    // In PT, ConvTranpose1d weight is (in, out, k) (or (in, out/groups, k)).
+    // Documentation says: "weight of shape (in_channels, out_channels/groups, kernel_size)".
+    // WeightNorm usually normalizes per output channel. So dimension 1.
+    // So we sum squares over (0, 2) and keep dim 1.
+
+    let norm_v = weight_v.sqr()?.sum_keepdim((0, 2))?.sqrt()?;
+
+    let weight = weight_v.broadcast_mul(&weight_g.broadcast_div(&norm_v)?)?;
+
+    let bias = vb.get(out_channels, "bias").ok();
+
+    let config = candle_nn::ConvTranspose1dConfig {
+        stride,
+        padding,
+        ..Default::default()
+    };
+
+    Ok(candle_nn::ConvTranspose1d::new(weight, bias, config))
+}
+
 /// CausalConv1d: A 1D convolution with causal padding
 /// Ensures that output at time t only depends on inputs at time <= t
 pub struct CausalConv1d {

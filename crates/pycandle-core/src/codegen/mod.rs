@@ -61,6 +61,7 @@ impl Codegen {
                 | "ConvTranspose1d"
                 | "ParametrizedConv1d"
                 | "ParametrizedLinear"
+                | "ParametrizedConvTranspose1d"
         )
     }
 
