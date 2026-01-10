@@ -3,53 +3,6 @@ use colored::Colorize;
 use std::fs;
 use std::path::Path;
 
-const RECORDER_TEMPLATE: &str = r#"import torch
-import sys
-import os
-
-# Try to import pycandle spy. 
-# in a real setup this would be installed, but for now we look in relative paths common in this workspace.
-try:
-    from pycandle.spy import GoldenRecorder
-except ImportError:
-    # Add potential fallback paths
-    possible_paths = ["py", "../py", "../../py"]
-    for p in possible_paths:
-        if os.path.exists(os.path.join(p, "spy.py")):
-            sys.path.append(p)
-            break
-    from spy import GoldenRecorder
-
-# TODO: Import your model class
-# from my_project.model import MyModel
-
-def main():
-    print("🚀 Initializing model configuration...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"   Device: {device}")
-
-    # TODO: Instantiate your model
-    # model = MyModel().to(device)
-    # model.eval()
-
-    # TODO: Create dummy input matching your model's requirement
-    # dummy_input = torch.randn(1, 3, 224, 224).to(device)
-
-    print("🎥 Starting recording...")
-    recorder = GoldenRecorder(output_dir="traces")
-    
-    # TODO: Run the forward pass with the recorder
-    # recorder.record(model, dummy_input)
-    
-    # Save the trace
-    name = "debug_run"
-    recorder.save(name)
-    print(f"✅ Recording saved to traces/{name}")
-
-if __name__ == "__main__":
-    main()
-"#;
-
 const TEST_TEMPLATE: &str = r#"#[cfg(test)]
 mod tests {
     use anyhow::Result;
@@ -70,52 +23,159 @@ mod tests {
 }
 "#;
 
-pub fn run_init(name: Option<String>) -> Result<()> {
+pub fn run_init(_name: Option<String>) -> Result<()> {
     println!("{}", "⚡ PyCandle Project Initialization".bold().green());
 
-    // 1. Create recorder.py
-    let recorder_path = Path::new("recorder.py");
-    if recorder_path.exists() {
-        println!("   {} recorder.py already exists, skipping.", "⚠️".yellow());
-    } else {
-        fs::write(recorder_path, RECORDER_TEMPLATE).context("Failed to write recorder.py")?;
-        println!("   {} Created recorder.py", "✅".green());
+    let root = Path::new(".pycandle");
+    let scripts_dir = root.join("scripts");
+    let generated_dir = root.join("generated");
+    let venv_dir = root.join("venv");
+
+    // 1. Create Directory Structure
+    // .pycandle/
+    // ├── scripts/
+    // ├── generated/
+    // └── venv/ (managed by uv)
+    if !root.exists() {
+        fs::create_dir(root).context("Failed to create .pycandle directory")?;
+        println!("   {} Created .pycandle/", "✅".green());
     }
 
-    // 2. Create .pycandle directory for generated code
-    let pycandle_dir = Path::new(".pycandle");
-    if !pycandle_dir.exists() {
-        fs::create_dir(pycandle_dir).ok();
-        println!("   {} Created .pycandle directory", "✅".green());
+    if !scripts_dir.exists() {
+        fs::create_dir(&scripts_dir).context("Failed to create .pycandle/scripts directory")?;
+        println!("   {} Created .pycandle/scripts/", "✅".green());
     }
 
-    // 3. Create tests directory and parity test if requested
+    if !generated_dir.exists() {
+        fs::create_dir(&generated_dir).context("Failed to create .pycandle/generated directory")?;
+        println!("   {} Created .pycandle/generated/", "✅".green());
+    }
+
+    // 2. Write Embedded Python Assets
+    let assets = [
+        ("spy.py", crate::python_assets::SPY_PY),
+        ("recorder.py", crate::python_assets::RECORDER_TEMPLATE_PY),
+        (
+            "weight_extractor.py",
+            crate::python_assets::WEIGHT_EXTRACTOR_PY,
+        ),
+        ("onnx_to_fx.py", crate::python_assets::ONNX_TO_FX_PY),
+    ];
+
+    for (filename, content) in assets {
+        let path = scripts_dir.join(filename);
+        if !path.exists() {
+            fs::write(&path, content).with_context(|| format!("Failed to write {}", filename))?;
+            println!("   {} Wrote .pycandle/scripts/{}", "✅".green(), filename);
+        } else {
+            println!(
+                "   {} .pycandle/scripts/{} already exists, skipping.",
+                "⚠️".yellow(),
+                filename
+            );
+        }
+    }
+
+    // 3. Setup Python Environment with uv
+    // Check if uv is installed
+    let uv_check = std::process::Command::new("uv").arg("--version").output();
+
+    match uv_check {
+        Ok(_) => {
+            println!(
+                "   {} Found uv, setting up virtual environment...",
+                "✅".green()
+            );
+
+            // uv venv .pycandle/venv
+            if !venv_dir.exists() {
+                let venv_status = std::process::Command::new("uv")
+                    .arg("venv")
+                    .arg(&venv_dir)
+                    .status()
+                    .context("Failed to run 'uv venv'")?;
+
+                if venv_status.success() {
+                    println!(
+                        "   {} Created virtual environment at .pycandle/venv",
+                        "✅".green()
+                    );
+                } else {
+                    println!("   {} 'uv venv' failed.", "❌".red());
+                }
+            } else {
+                println!(
+                    "   {} .pycandle/venv already exists, skipping creation.",
+                    "⚠️".yellow()
+                );
+            }
+
+            // Install clear dependencies
+            // We use 'uv pip install' into that venv
+            println!("   ⏳ Installing dependencies (torch, safetensors, transformers, onnx)...");
+
+            // Determine python path (windows vs unix)
+            #[cfg(windows)]
+            let python_path = venv_dir.join("Scripts").join("python.exe");
+            #[cfg(not(windows))]
+            let python_path = venv_dir.join("bin").join("python");
+
+            // We can use `uv pip install` directly by pointing to the environment if we encourage that,
+            // or just use the python binary to call pip? uv recommends `uv pip install --python <venv> ...`
+            let install_status = std::process::Command::new("uv")
+                .arg("pip")
+                .arg("install")
+                .arg("--python")
+                .arg(&venv_dir) // implicit python path resolution by uv
+                .arg("torch")
+                .arg("safetensors")
+                .arg("transformers") // usually needed for HF models
+                .arg("accelerate") // good for large model loading
+                .arg("onnx")
+                .arg("onnx2torch")
+                .status()
+                .context("Failed to install dependencies");
+
+            match install_status {
+                Ok(status) if status.success() => {
+                    println!("   {} Dependencies installed successfully.", "✅".green());
+                }
+                _ => {
+                    println!(
+                        "   {} Failed to install dependencies. You may need to run 'uv pip install torch safetensors transformers onnx onnx2torch' manually.",
+                        "❌".red()
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            println!(
+                "   {} uv not found. Please install uv (https://github.com/astral-sh/uv) to manage dependencies automatically.",
+                "⚠️".yellow()
+            );
+            println!(
+                "   You will need to create a venv and install: torch, safetensors, transformers manually."
+            );
+        }
+    }
+
+    // 4. Create tests directory (Legacy/Standard)
     let tests_dir = Path::new("tests");
     if !tests_dir.exists() {
-        fs::create_dir(tests_dir).ok(); // failure ok, maybe we are not in root
+        fs::create_dir(tests_dir).ok();
     }
-
     let test_path = tests_dir.join("parity.rs");
     if tests_dir.exists() && !test_path.exists() {
         fs::write(&test_path, TEST_TEMPLATE).context("Failed to write tests/parity.rs")?;
         println!("   {} Created tests/parity.rs", "✅".green());
-    } else {
-        println!(
-            "   {} tests/parity.rs already exists (or tests/ missing), skipping.",
-            "⚠️".yellow()
-        );
     }
 
     println!("\nNext steps:");
-    println!("1. Edit {} to import your model.", "recorder.py".bold());
     println!(
-        "2. Run {} to capture traces.",
-        "pycandle record --script recorder.py --name debug_run".bold()
+        "1. Edit {} to import your model.",
+        ".pycandle/scripts/recorder.py".bold()
     );
-    println!(
-        "3. Run {} to generate Rust code.",
-        "pycandle codegen ...".bold()
-    );
+    println!("2. Run {} to capture traces.", "pycandle record".bold());
 
     Ok(())
 }

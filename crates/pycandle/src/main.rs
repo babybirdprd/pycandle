@@ -4,6 +4,7 @@
 
 mod dashboard;
 mod init;
+mod python_assets;
 mod report;
 mod test_gen;
 mod todos;
@@ -181,7 +182,9 @@ fn main() -> Result<()> {
 
             let status = Command::new("uv")
                 .arg("run")
-                .arg("python")
+                .arg("--python")
+                .arg(".pycandle/venv")
+                .arg("python") // uv run --python <venv> python <script>
                 .arg(script)
                 .spawn()
                 .context("Failed to spawn uv run")?
@@ -414,8 +417,9 @@ fn main() -> Result<()> {
                 println!("🔪 Performing surgical weight extraction...");
                 let mut cmd = Command::new("uv");
                 cmd.arg("run")
-                    .arg("python")
-                    .arg("py/weight_extractor.py")
+                    .arg("--python")
+                    .arg(".pycandle/venv")
+                    .arg(".pycandle/scripts/weight_extractor.py")
                     .arg("--checkpoint")
                     .arg(&checkpoint)
                     .arg("--manifest")
@@ -482,11 +486,9 @@ fn main() -> Result<()> {
 
             let status = Command::new("uv")
                 .arg("run")
-                .arg("--project")
-                .arg("py")
-                .env("PYTHONPATH", "py")
-                .arg("python")
-                .arg("py/onnx_to_fx.py")
+                .arg("--python")
+                .arg(".pycandle/venv") // Use the managed venv
+                .arg(".pycandle/scripts/onnx_to_fx.py")
                 .arg("--onnx")
                 .arg(&onnx)
                 .arg("--name")

@@ -6,39 +6,39 @@ PyCandle captures activation traces from PyTorch models to generate verified Rus
 
 ## Quick Start
 
-### 1. Record a PyTorch model
-
-```python
-# your_model_script.py
-import sys
-sys.path.insert(0, "path/to/pycandle/py")
-
-import torch
-from spy import GoldenRecorder
-
-# Your PyTorch model
-model = MyModel()
-model.eval()
-
-# Create dummy input
-x = torch.randn(1, 128)
-
-# Record
-recorder = GoldenRecorder(output_dir="traces")
-recorder.record(model, x)
-recorder.save("my_model")
-```
-
-### 2. Generate Candle code
+### 1. Initialize Project
+Run `pycandle init` to set up your project. This creates a `.pycandle` directory with a managed virtual environment and necessary scripts.
 
 ```bash
-cargo run -p pycandle -- codegen \
-    --manifest traces/my_model_manifest.json \
-    --out generated_my_model.rs \
-    --model MyModel
+pycandle init
 ```
 
-### 3. Use generated code with parity checking
+Start the recording template:
+```bash
+# Edit the generated recorder to import your model
+code .pycandle/scripts/recorder.py
+```
+
+### 2. Record Trace
+Run the recorder to capture the model's architecture and weights (or just architecture if using meta device).
+
+```bash
+pycandle record --script .pycandle/scripts/recorder.py --name my_model
+```
+
+### 3. Generate Code
+Generate the Rust implementation from the captured trace.
+
+```bash
+pycandle codegen --manifest .pycandle/traces/my_model_manifest.json --out src/model.rs
+```
+
+### 4. Parity Check
+Run the generated parity tests to ensure the Rust implementation matches PyTorch exactly.
+
+```bash
+cargo test
+```
 
 ```rust
 use pycandle_core::{PyChecker, py_check};
