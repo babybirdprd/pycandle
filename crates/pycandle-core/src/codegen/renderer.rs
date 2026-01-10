@@ -1,7 +1,10 @@
 use super::gpt2;
 use crate::LayerMeta;
+use crate::codegen::ModuleNode;
 use regex::Regex;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 struct GroupInfo {
     _name: String,
@@ -10,50 +13,53 @@ struct GroupInfo {
 }
 
 impl super::Codegen {
-    fn get_groups(&self) -> HashMap<String, GroupInfo> {
-        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut types: HashMap<String, String> = HashMap::new();
-        let re = Regex::new(r"^(.*)\.(\d+)$").unwrap();
+    fn resolve_path(&self, root: &ModuleNode, target: &str) -> String {
+        let parts: Vec<&str> = target.split('.').collect();
+        let mut current = root;
+        let mut path = Vec::new();
 
-        for (name, meta) in &self.manifest {
-            if let Some(caps) = re.captures(name) {
-                let base = caps.get(1).unwrap().as_str().to_string();
-                let idx = caps.get(2).unwrap().as_str().parse::<usize>().unwrap();
-                groups.entry(base.clone()).or_default().push(idx);
-                types.insert(base, meta.module_type.clone());
-            }
-        }
-
-        let mut result = HashMap::new();
-        for (base, indices) in groups {
-            // Only group if we have at least 2 items and they are roughly sequential
-            if indices.len() > 1 {
-                let max_idx = *indices.iter().max().unwrap();
-                if max_idx == indices.len() - 1 {
-                    result.insert(
-                        base.clone(),
-                        GroupInfo {
-                            _name: base.clone(),
-                            count: indices.len(),
-                            module_type: types[&base].clone(),
-                        },
-                    );
+        for (_, part) in parts.iter().enumerate() {
+            // Check if we are at an Array index
+            if let Ok(idx) = part.parse::<usize>() {
+                path.push(format!("[{}]", idx));
+                // array traversal
+                if let ModuleNode::Array(arr) = current {
+                    if idx < arr.len() {
+                        current = &arr[idx];
+                    } else {
+                        // Fallback or error?
+                        // If index out of bounds structurally (unlikely in valid trace),
+                        // we assume homogenous array and just take the first one for type logic,
+                        // but for PATH resolution, we just accept the index.
+                        // But we need 'current' to advance.
+                        if !arr.is_empty() {
+                            current = &arr[0]; // best effort for traversing type info if valid
+                        }
+                    }
                 }
+                continue;
             }
-        }
-        result
-    }
 
-    fn resolve_target(&self, target: &str, groups: &HashMap<String, GroupInfo>) -> String {
-        let re = Regex::new(r"^(.*)\.(\d+)$").unwrap();
-        if let Some(caps) = re.captures(target) {
-            let base = caps.get(1).unwrap().as_str();
-            let idx = caps.get(2).unwrap().as_str();
-            if groups.contains_key(base) {
-                return format!("{}[{}]", self.sanitize_name(base), idx);
+            // Normal field traversal
+            path.push(format!(".{}", self.sanitize_name(part)));
+
+            match current {
+                ModuleNode::Struct(children) => {
+                    if let Some(child) = children.get(*part) {
+                        current = child;
+                    }
+                }
+                _ => {}
             }
         }
-        self.sanitize_name(target)
+
+        // Join path, remove leading dot if exists (it will be tacked onto 'self')
+        let full = path.join("");
+        if full.starts_with('.') {
+            full[1..].to_string()
+        } else {
+            full
+        }
     }
 
     pub fn generate_model_rs(&self, model_name: &str) -> String {
@@ -85,12 +91,19 @@ impl Cache {
             );
         }
 
-        // Generate Model struct
-        code.push_str(&self.generate_struct(model_name));
-        code.push_str("\n");
+        let module_tree = self.build_module_tree();
 
-        // Generate Implementation
-        code.push_str(&self.generate_impl(model_name));
+        // Generate Model struct and sub-structs recursively
+        // This populates the registry
+        let root_type_name = self.render_node(model_name, &module_tree);
+
+        // Dump all definitions in order
+        for def in self.struct_definitions.borrow().iter() {
+            code.push_str(def);
+        }
+
+        // Generate Root Forward Impl (always unique to root)
+        code.push_str(&self.render_root_forward(&root_type_name, &module_tree));
 
         code
     }
@@ -116,140 +129,223 @@ impl Cache {
         code
     }
 
-    fn generate_struct(&self, model_name: &str) -> String {
-        let mut code = String::new();
-        code.push_str(&format!("pub struct {} {{\n", model_name));
-
-        let groups = self.get_groups();
-        let mut handled_groups = HashSet::new();
-
-        // Sort names for deterministic output
-        let mut names: Vec<_> = self.manifest.keys().collect();
-        names.sort();
-
-        for name in names {
-            // Check if part of a group
-            let re = Regex::new(r"^(.*)\.(\d+)$").unwrap();
-            if let Some(caps) = re.captures(name) {
-                let base = caps.get(1).unwrap().as_str();
-                if let Some(info) = groups.get(base) {
-                    if handled_groups.contains(base) {
-                        continue;
+    // Recursive Node Renderer with Deduplication
+    fn render_node(&self, type_name: &str, node: &ModuleNode) -> String {
+        match node {
+            ModuleNode::Struct(children) => {
+                // 1. Recurse children first to get their confirmed type names
+                let mut child_types = HashMap::new();
+                for (name, child) in children {
+                    let child_type_name = match child {
+                        ModuleNode::Leaf(_) => String::new(), // Leaves don't have generated types
+                        ModuleNode::Struct(_) => {
+                            let proposed = format!("{}{}", type_name, self.camel_case(name));
+                            self.render_node(&proposed, child)
+                        }
+                        ModuleNode::Array(arr) => {
+                            if !arr.is_empty() {
+                                match &arr[0] {
+                                    ModuleNode::Struct(_) => {
+                                        let proposed = if name.ends_with('s') {
+                                            // hacky plural de-pluralization? No, just append
+                                            format!("{}{}", type_name, self.camel_case(name))
+                                        } else {
+                                            format!("{}{}", type_name, self.camel_case(name))
+                                        };
+                                        self.render_node(&proposed, &arr[0])
+                                    }
+                                    _ => String::new(),
+                                }
+                            } else {
+                                String::new()
+                            }
+                        }
+                    };
+                    if !child_type_name.is_empty() {
+                        child_types.insert(name.clone(), child_type_name);
                     }
-                    // Generate Vector field
-                    let rust_type = self.map_type(&info.module_type);
-                    code.push_str(&format!("    /// Group: {} (x{})\n", base, info.count));
-                    code.push_str(&format!(
-                        "    pub {}: Vec<{}>,\n",
-                        self.sanitize_name(base),
-                        rust_type
-                    ));
-                    handled_groups.insert(base.to_string());
-                    continue;
                 }
-            }
 
-            let meta = &self.manifest[name];
-            let sanitized = self.sanitize_name(name);
-            let rust_type = self.map_type(&meta.module_type);
+                // 2. Generate Struct Definition
+                let mut struct_code = String::new();
+                struct_code.push_str(&format!(
+                    "#[derive(Clone, Debug)]\npub struct {} {{\n",
+                    type_name
+                )); // Added Debug, Clone
+                for (name, child) in children {
+                    let field_name = self.sanitize_name(name);
+                    let type_str = match child {
+                        ModuleNode::Leaf(meta) => self.map_type(&meta.module_type).into(),
+                        ModuleNode::Struct(_) => child_types[name].clone(),
+                        ModuleNode::Array(arr) => {
+                            if arr.is_empty() {
+                                "Vec<Tensor> /* Empty Array */".to_string()
+                            } else {
+                                let inner = match &arr[0] {
+                                    ModuleNode::Leaf(meta) => {
+                                        self.map_type(&meta.module_type).into()
+                                    }
+                                    ModuleNode::Struct(_) => child_types[name].clone(),
+                                    ModuleNode::Array(_) => {
+                                        "Vec<Tensor> /* Nested Array */".to_string()
+                                    }
+                                };
+                                format!("Vec<{}>", inner)
+                            }
+                        }
+                    };
 
-            // Docstring Injection
-            code.push_str(&format!("    /// Layer: {}\n", name));
-            if !meta.input_shapes.is_empty() {
-                code.push_str(&format!("    /// Input: {:?}\n", meta.input_shapes));
-            }
-            if !meta.parameters.is_empty() {
-                code.push_str(&format!(
-                    "    /// Params: {} tensors\n",
-                    meta.parameters.len()
-                ));
-            }
+                    if let ModuleNode::Leaf(meta) = child {
+                        if !meta.input_shapes.is_empty() {
+                            struct_code
+                                .push_str(&format!("    /// Input: {:?}\n", meta.input_shapes));
+                        }
+                    }
+                    struct_code.push_str(&format!("    pub {}: {},\n", field_name, type_str));
+                }
 
-            code.push_str(&format!("    pub {}: {},\n", sanitized, rust_type));
+                // Add Config to root? No, we'll handle config in load manually for now or just generic.
+                // If it's the root, we might want it.
+                // But deduplication breaks "Is Root" concept.
+                // Only the actual usage knows.
+                // We'll standardise: `load` takes `&Config` (except root wrapper which we'll handle outside).
+
+                struct_code.push_str("}\n\n");
+
+                // 3. Generate Impl Load
+                let mut impl_code = String::new();
+                impl_code.push_str(&format!("impl {} {{\n", type_name));
+                impl_code.push_str(
+                    "    pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {\n",
+                );
+                impl_code.push_str("        Ok(Self {\n");
+
+                for (name, child) in children {
+                    let field_name = self.sanitize_name(name);
+                    match child {
+                        ModuleNode::Leaf(meta) => {
+                            let init = self.generate_init(name, meta);
+                            impl_code.push_str(&format!("            {}: {},\n", field_name, init));
+                        }
+                        ModuleNode::Struct(_) => {
+                            let child_type = &child_types[name];
+                            impl_code.push_str(&format!(
+                                "            {}: {}::load(vb.pp(\"{}\"), config)?,\n",
+                                field_name, child_type, name
+                            ));
+                        }
+                        ModuleNode::Array(arr) => {
+                            if arr.is_empty() {
+                                impl_code.push_str(&format!(
+                                    "            {}: Vec::new(),\n",
+                                    field_name
+                                ));
+                            } else {
+                                impl_code.push_str(&format!(
+                                    "            {}: (0..{}).map(|i| {{\n",
+                                    field_name,
+                                    arr.len()
+                                ));
+                                match &arr[0] {
+                                    ModuleNode::Leaf(meta) => {
+                                        let replacement = format!(
+                                            "vb.pp(&format!(\"{{}}.{{}}\", \"{}\", i))",
+                                            name
+                                        );
+                                        let template = self.generate_init("PLACEHOLDER", meta);
+                                        let fixed = template
+                                            .replace("vb.pp(\"PLACEHOLDER\")", &replacement);
+                                        impl_code.push_str(&format!("                {}\n", fixed));
+                                    }
+                                    ModuleNode::Struct(_) => {
+                                        let child_type = &child_types[name];
+                                        impl_code.push_str(&format!("                {}::load(vb.pp(&format!(\"{{}}.{{}}\", \"{}\", i)), config)?\n", child_type, name));
+                                    }
+                                    _ => impl_code.push_str("todo!(),\n"),
+                                }
+                                impl_code
+                                    .push_str("            }).collect::<Result<Vec<_>>>()?,\n");
+                            }
+                        }
+                    }
+                }
+                impl_code.push_str("        })\n");
+                impl_code.push_str("    }\n");
+                impl_code.push_str("}\n\n");
+
+                // 4. Compute Hash
+                // Note: We need to anonymize the struct name in the code before hashing?
+                // OR: We include the body, but wait, the body contains `child_types`.
+                // If child A and child B are identical, `child_types` will preserve that.
+                // The Type Name *inside* the struct definition must be generic for the hash?
+                // No, because the child type name IS the identifier.
+                // `Box<BlockA>` vs `Box<BlockB>`.
+                // If `BlockA` was deduplicated to `Block`, then `BlockB` also became `Block`.
+                // So the *content* is identical.
+                // BUT the `struct Name {` ... `impl Name` parts need to be normalized before hashing.
+                // Replace `type_name` with "SELF" for hashing.
+
+                let anon_struct_code = struct_code.replace(type_name, "SELF_STRUCT_NAME");
+                let anon_impl_code = impl_code.replace(type_name, "SELF_STRUCT_NAME");
+
+                let mut hasher = DefaultHasher::new();
+                anon_struct_code.hash(&mut hasher);
+                anon_impl_code.hash(&mut hasher);
+                let signature = hasher.finish();
+
+                // 5. Check Registry
+                let mut registry = self.struct_registry.borrow_mut();
+                if let Some(existing_name) = registry.get(&signature) {
+                    return existing_name.clone();
+                }
+
+                // 6. Register New
+                registry.insert(signature, type_name.to_string());
+
+                // Add to definitions
+                let full_code = format!("{}{}", struct_code, impl_code);
+                self.struct_definitions.borrow_mut().push(full_code);
+
+                type_name.to_string()
+            }
+            _ => String::new(),
         }
-
-        // Add config
-        code.push_str("    pub config: Config,\n");
-
-        code.push_str("}\n");
-        code
     }
 
-    fn generate_impl(&self, model_name: &str) -> String {
-        let mut code = String::new();
-        code.push_str(&format!("impl {} {{\n", model_name));
+    // CamelCase Helper
+    fn camel_case(&self, s: &str) -> String {
+        let mut result = String::new();
+        let mut capitalize = true;
+        for c in s.chars() {
+            if c == '_' || c == '.' {
+                capitalize = true;
+            } else {
+                if capitalize {
+                    result.push(c.to_ascii_uppercase());
+                    capitalize = false;
+                } else {
+                    result.push(c);
+                }
+            }
+        }
+        result
+    }
 
-        // Load method
+    fn render_root_forward(&self, type_name: &str, root_node: &ModuleNode) -> String {
+        let mut code = String::new();
+        code.push_str(&format!("impl {} {{\n", type_name));
+
+        // 1. load_from_hub (Root Specific)
         code.push_str("    pub fn load_from_hub(repo: &str, revision: &str, device: &Device, config: Config) -> Result<Self> {
         let api = hf_hub::api::sync::Api::new()?;
         let repo = api.model(repo.to_string()).with_revision(revision.to_string());
         let path = repo.get(\"model.safetensors\")?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], device.clone())? };
-        Self::load(vb, config)
+        Self::load(vb, &config)
     }
+");
 
-    pub fn load(vb: VarBuilder, config: Config) -> Result<Self> {\n");
-        code.push_str("        Ok(Self {\n");
-
-        let groups = self.get_groups();
-        let mut handled_groups = HashSet::new();
-        let mut names: Vec<_> = self.manifest.keys().collect();
-        names.sort();
-
-        for name in names {
-            let re = Regex::new(r"^(.*)\.(\d+)$").unwrap();
-            if let Some(caps) = re.captures(name) {
-                let base = caps.get(1).unwrap().as_str();
-                if let Some(info) = groups.get(base) {
-                    if handled_groups.contains(base) {
-                        continue;
-                    }
-                    let sanitized = self.sanitize_name(base);
-                    // Vector Load Loop
-                    code.push_str(&format!(
-                        "            {}: (0..{}).map(|i| {{\n",
-                        sanitized, info.count
-                    ));
-                    // We need to generate init for one item to see the pattern, but with dynamic name
-                    // Hack: Generate init for base.0, then replace base.0 with key using regex or format
-                    // Better: The `generate_init` takes `layer_name`.
-                    // We can call `generate_init` with `format!(\"{}.{}\", base, i)`?
-                    // But `generate_init` looks up manifest. manifest needs real key.
-                    // We have real keys in manifest.
-                    // So inside the map loop, we can't easily call generate_init dynamic text unless we inline the logic.
-                    // Or we assume all items in group are identical types (they are) and use base.0 as template?
-                    // Yes, use base.0 as template, but replace "base.0" string in generated code with dynamic format.
-
-                    let template_key = format!("{}.0", base);
-                    let meta = &self.manifest[&template_key];
-                    let init_code = self.generate_init(&template_key, meta);
-
-                    // Replace "base.0" with "{}.{}", base, i in the logic?
-                    // generate_init generates `vb.pp("base.0")`.
-                    // We want `vb.pp(&format!("{}.{}", base, i))`.
-                    let fixed_init = init_code.replace(
-                        &format!("\"{}\"", template_key),
-                        &format!("&format!(\"{}.{{}}\", i)", base),
-                    );
-
-                    code.push_str(&format!("                {}\n", fixed_init));
-                    code.push_str("            }).collect::<Result<Vec<_>>>()?,\n");
-
-                    handled_groups.insert(base.to_string());
-                    continue;
-                }
-            }
-
-            let meta = &self.manifest[name];
-            let sanitized = self.sanitize_name(name);
-            let init = self.generate_init(name, meta);
-            code.push_str(&format!("            {}: {},\n", sanitized, init));
-        }
-        code.push_str("            config,\n");
-        code.push_str("        })\n");
-        code.push_str("    }\n\n");
-
-        // Forward method
+        // 2. forward (DAG or Sequential)
         let ret_type = self.get_forward_return_type();
         let forward_args = if self.stateful {
             "&self, xs: &Tensor, cache: &mut Cache"
@@ -262,188 +358,149 @@ impl Cache {
         ));
 
         if !self.graph_nodes.is_empty() {
-            code.push_str(&self.generate_forward_dag(&self.graph_nodes));
-        } else {
-            code.push_str("        let mut x = xs.clone();\n");
+            let nodes = &self.graph_nodes;
+            let mut var_map = HashMap::new();
+            let mut placeholders = Vec::new();
 
-            // Sequential Strategy with Groups
-            let groups = self.get_groups(); // Re-compute or reuse? 
-            let mut handled_groups = HashSet::new();
-            let mut names: Vec<_> = self.manifest.keys().collect();
-            names.sort();
+            // 1. Collect placeholders and identify node return types
+            let mut node_types = HashMap::new();
+            for node in nodes {
+                if node.op == "placeholder" {
+                    placeholders.push(node.name.clone());
+                    node_types.insert(node.name.clone(), super::types::ReturnType::Tensor);
+                } else if node.op == "call_module" {
+                    node_types.insert(node.name.clone(), super::types::ReturnType::Tensor);
+                }
+            }
 
-            for name in names {
-                let re = Regex::new(r"^(.*)\.(\d+)$").unwrap();
-                if let Some(caps) = re.captures(name) {
-                    let base = caps.get(1).unwrap().as_str();
-                    if let Some(_) = groups.get(base) {
-                        if handled_groups.contains(base) {
-                            continue;
-                        }
-                        let sanitized = self.sanitize_name(base);
-                        code.push_str(&format!("        for layer in &self.{} {{\n", sanitized));
-                        code.push_str("            x = layer.forward(&x)?;\n");
-                        code.push_str("        }\n");
-                        handled_groups.insert(base.to_string());
-                        continue;
-                    }
+            // 2. Map placeholders to arguments
+            // Currently we assume the first placeholder is 'xs'
+            for (i, p) in placeholders.iter().enumerate() {
+                if i == 0 {
+                    var_map.insert(p.clone(), "xs".to_string());
+                } else {
+                    // FEATURE: Multiple inputs
+                    var_map.insert(p.clone(), format!("xs{}", i));
+                }
+            }
+
+            // 3. Process nodes
+            for node in nodes {
+                if node.op == "placeholder" {
+                    continue;
                 }
 
-                let sanitized = self.sanitize_name(name);
-                code.push_str(&format!("        x = self.{}.forward(&x)?;\n", sanitized));
+                let sanitized = self.sanitize_name(&node.name);
+
+                if node.op == "call_module" {
+                    let args: Vec<String> = node
+                        .args
+                        .iter()
+                        .map(|a| self.resolve_fx_arg(a, &var_map))
+                        .collect();
+
+                    let call_args = if args.is_empty() {
+                        "/* error: no args for module call */".to_string()
+                    } else {
+                        format!("&{}", args[0])
+                    };
+
+                    // Recursive Path Resolution
+                    let target_sanitized = self.resolve_path(root_node, &node.target);
+
+                    code.push_str(&format!(
+                        "        let {} = self.{}.forward({})?;\n",
+                        sanitized, target_sanitized, call_args
+                    ));
+                    var_map.insert(node.name.clone(), sanitized);
+                } else if node.op == "call_function" || node.op == "call_method" {
+                    let args: Vec<String> = node
+                        .args
+                        .iter()
+                        .map(|a| self.resolve_fx_arg(a, &var_map))
+                        .collect();
+
+                    let (expr, ret) = if node.op == "call_function" {
+                        self.map_fx_op(
+                            &node.target,
+                            &args,
+                            &var_map,
+                            &node_types,
+                            &node.args,
+                            &node.kwargs,
+                        )
+                    } else {
+                        let self_var = &args[0];
+                        let method_args = &args[1..];
+                        self.map_fx_method(
+                            &node.target,
+                            self_var,
+                            node.args[0].as_str().unwrap_or(""),
+                            method_args,
+                            &node_types,
+                            &node.kwargs,
+                            &var_map,
+                        )
+                    };
+
+                    node_types.insert(node.name.clone(), ret);
+
+                    // Auto-Contiguous Heuristic
+                    if node.target == "permute" || node.target == "transpose" || node.target == "t"
+                    {
+                        self.permuted_vars.borrow_mut().insert(sanitized.clone());
+                    }
+
+                    if (node.target == "view" || node.target == "reshape") && !args.is_empty() {
+                        if let Some(arg0) = args.get(0) {
+                            if self.permuted_vars.borrow().contains(arg0) {
+                                // Logic implicit via map_fx_method?
+                            }
+                        }
+                    }
+
+                    code.push_str(&format!("        let {} = {};\n", sanitized, expr));
+                    var_map.insert(node.name.clone(), sanitized);
+                } else if node.op == "output" {
+                    let arg0 = &node.args[0];
+                    if let Some(s) = arg0.as_str() {
+                        if s.contains("{") && s.contains("}") {
+                            let values = self.extract_values_from_dict_string(s);
+                            let mapped: Vec<String> = values
+                                .iter()
+                                .map(|v| var_map.get(v).cloned().unwrap_or(v.clone()))
+                                .collect();
+                            code.push_str(&format!("        Ok(({}))\n", mapped.join(", ")));
+                        } else {
+                            let val = var_map.get(s).cloned().unwrap_or(s.to_string());
+                            code.push_str(&format!("        Ok({})\n", val));
+                        }
+                    } else if let Some(arr) = arg0.as_array() {
+                        let mut mapped = Vec::new();
+                        for v in arr {
+                            if let Some(s) = v.as_str() {
+                                mapped.push(var_map.get(s).cloned().unwrap_or(s.to_string()));
+                            }
+                        }
+                        if mapped.len() > 1 {
+                            code.push_str(&format!("        Ok(({}))\n", mapped.join(", ")));
+                        } else {
+                            code.push_str(&format!("        Ok({})\n", mapped[0]));
+                        }
+                    } else {
+                        code.push_str(&format!("        Ok({})\n", arg0));
+                    }
+                }
             }
-            code.push_str("        Ok(x)\n");
+        } else {
+            code.push_str("        // TODO: Sequential fallback with recursive tree\n");
+            code.push_str(
+                "        todo!(\"Sequential fallback not implemented for recursive tree\")\n",
+            );
         }
 
         code.push_str("    }\n");
         code.push_str("}\n");
-        code
-    }
-
-    fn generate_forward_dag(&self, nodes: &[super::types::GraphNode]) -> String {
-        let mut code = String::new();
-        let mut var_map = HashMap::new();
-        let mut placeholders = Vec::new();
-
-        // 1. Collect placeholders and identify node return types
-        let mut node_types = HashMap::new();
-        for node in nodes {
-            if node.op == "placeholder" {
-                placeholders.push(node.name.clone());
-                node_types.insert(node.name.clone(), super::types::ReturnType::Tensor);
-            } else if node.op == "call_module" {
-                node_types.insert(node.name.clone(), super::types::ReturnType::Tensor);
-            }
-            // Other ops will have their types inferred in map_fx_op
-        }
-
-        // 2. Map placeholders to arguments
-        // Currently we assume the first placeholder is 'xs'
-        for (i, p) in placeholders.iter().enumerate() {
-            if i == 0 {
-                var_map.insert(p.clone(), "xs".to_string());
-            } else {
-                // FEATURE: Multiple inputs
-                var_map.insert(p.clone(), format!("xs{}", i));
-            }
-        }
-
-        // 3. Process nodes
-        for node in nodes {
-            if node.op == "placeholder" {
-                continue;
-            }
-
-            let sanitized = self.sanitize_name(&node.name);
-
-            if node.op == "call_module" {
-                let args: Vec<String> = node
-                    .args
-                    .iter()
-                    .map(|a| self.resolve_fx_arg(a, &var_map))
-                    .collect();
-
-                let call_args = if args.is_empty() {
-                    "/* error: no args for module call */".to_string()
-                } else {
-                    format!("&{}", args[0])
-                };
-
-                // Groups resolution
-                let groups = self.get_groups();
-                let target_sanitized = self.resolve_target(&node.target, &groups);
-
-                code.push_str(&format!(
-                    "        let {} = self.{}.forward({})?;\n",
-                    sanitized, target_sanitized, call_args
-                ));
-                var_map.insert(node.name.clone(), sanitized);
-            } else if node.op == "call_function" || node.op == "call_method" {
-                let args: Vec<String> = node
-                    .args
-                    .iter()
-                    .map(|a| self.resolve_fx_arg(a, &var_map))
-                    .collect();
-
-                let (expr, ret) = if node.op == "call_function" {
-                    self.map_fx_op(
-                        &node.target,
-                        &args,
-                        &var_map,
-                        &node_types,
-                        &node.args,
-                        &node.kwargs,
-                    )
-                } else {
-                    let self_var = &args[0];
-                    let method_args = &args[1..];
-                    self.map_fx_method(
-                        &node.target,
-                        self_var,
-                        node.args[0].as_str().unwrap_or(""),
-                        method_args,
-                        &node_types,
-                        &node.kwargs,
-                        &var_map,
-                    )
-                };
-
-                node_types.insert(node.name.clone(), ret);
-
-                // Auto-Contiguous Heuristic
-                // If this op was permute/transpose, mark it
-                if node.target == "permute" || node.target == "transpose" || node.target == "t" {
-                    self.permuted_vars.borrow_mut().insert(sanitized.clone());
-                }
-
-                // If this op is view/reshape, and input was permuted, inject .contiguous()
-                if (node.target == "view" || node.target == "reshape") && !args.is_empty() {
-                    if let Some(arg0) = args.get(0) {
-                        // Check if arg0 (the variable name) is in our permuted set
-                        // We need to resolve it back to the sanitized name
-                        if self.permuted_vars.borrow().contains(arg0) {
-                            // We can't change the generated code of the previous line easily here
-                            // But we can check if the generated expr for THIS line starts with arg0
-                            // Actually, map_fx_method generates "{}.view(...)", so we can just inject it there?
-                            // No, map_fx_method is called above.
-                            // Better: In map_fx_method, check if self_var is in permuted_vars.
-                        }
-                    }
-                }
-
-                code.push_str(&format!("        let {} = {};\n", sanitized, expr));
-                var_map.insert(node.name.clone(), sanitized);
-            } else if node.op == "output" {
-                let arg0 = &node.args[0];
-                if let Some(s) = arg0.as_str() {
-                    if s.contains("{") && s.contains("}") {
-                        let values = self.extract_values_from_dict_string(s);
-                        let mapped: Vec<String> = values
-                            .iter()
-                            .map(|v| var_map.get(v).cloned().unwrap_or(v.clone()))
-                            .collect();
-                        code.push_str(&format!("        Ok(({}))\n", mapped.join(", ")));
-                    } else {
-                        let val = var_map.get(s).cloned().unwrap_or(s.to_string());
-                        code.push_str(&format!("        Ok({})\n", val));
-                    }
-                } else if let Some(arr) = arg0.as_array() {
-                    let mut mapped = Vec::new();
-                    for v in arr {
-                        if let Some(s) = v.as_str() {
-                            mapped.push(var_map.get(s).cloned().unwrap_or(s.to_string()));
-                        }
-                    }
-                    if mapped.len() > 1 {
-                        code.push_str(&format!("        Ok(({}))\n", mapped.join(", ")));
-                    } else {
-                        code.push_str(&format!("        Ok({})\n", mapped[0]));
-                    }
-                } else {
-                    code.push_str(&format!("        Ok({})\n", arg0));
-                }
-            }
-        }
 
         code
     }

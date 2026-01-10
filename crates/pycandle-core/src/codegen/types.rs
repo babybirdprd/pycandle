@@ -55,7 +55,14 @@ pub struct GraphNode {
     pub module_type: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SymbolicConfig {
     pub dims: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ModuleNode {
+    Leaf(crate::LayerMeta),
+    Struct(std::collections::BTreeMap<String, ModuleNode>),
+    Array(Vec<ModuleNode>),
 }
