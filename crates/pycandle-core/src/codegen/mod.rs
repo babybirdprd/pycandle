@@ -67,8 +67,11 @@ impl Codegen {
 
     pub fn build_module_tree(&self) -> ModuleNode {
         let mut root = std::collections::BTreeMap::new();
-        for (name, meta) in &self.manifest {
-            let parts: Vec<&str> = name.split('.').collect();
+        for meta in self.manifest.values() {
+            if meta.name.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = meta.name.split('.').collect();
             self.insert_into_tree(&mut root, &parts, meta.clone());
         }
         let root = self.compress_arrays(ModuleNode::Struct(root));

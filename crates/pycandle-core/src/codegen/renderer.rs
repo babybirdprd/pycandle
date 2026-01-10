@@ -1,16 +1,9 @@
 use super::gpt2;
 use crate::LayerMeta;
 use crate::codegen::ModuleNode;
-use regex::Regex;
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-
-struct GroupInfo {
-    _name: String,
-    count: usize,
-    module_type: String,
-}
 
 impl super::Codegen {
     fn resolve_path(&self, root: &ModuleNode, target: &str) -> String {
