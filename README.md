@@ -72,6 +72,8 @@ Launch the TUI Dashboard to see real-time pass/fail rates and drift heatmaps.
 pycandle dashboard
 ```
 
+![PyCandle Dashboard](docs/images/dashboard.png)
+
 ---
 
 ## 📦 Advanced Features
