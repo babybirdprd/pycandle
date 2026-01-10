@@ -187,9 +187,10 @@ class GoldenRecorder:
                 "Linear", "Conv1d", "Conv2d", "LayerNorm", "Embedding", "ReLU", "GELU", 
                 "Sigmoid", "Tanh", "ELU", "LeakyReLU", "Snake", "BatchNorm1d", "BatchNorm2d",
                 "LSTM", "CausalConv1d", "Mish", "SiLU", "NewGELUActivation", "Dropout",
-                "Transpose", "SinusoidalPosEmb", "LlamaRMSNorm", "ModuleList", "Sequential"
+                "Transpose", "SinusoidalPosEmb", "LlamaRMSNorm", "ModuleList", "Sequential",
+                "Conv1D"
             }
-            if module_type not in supported_ops:
+            if module_type not in supported_ops and len(list(m.children())) == 0:
                 print(f"⚠️  WARNING: Custom or potentially unsupported Op detected: {module_type} ({name})")
                 print(f"    PyCandle might not support this layer automatically. You may need to implement a custom kernel.")
 

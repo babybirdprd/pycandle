@@ -41,7 +41,7 @@ pub fn map_type(py_type: &str) -> Option<String> {
     match py_type {
         "GPT2Model" | "GPT2LMHeadModel" => Some("gpt2::GPTModel".to_string()),
         "GPT2Block" => Some("gpt2::TransformerBlock".to_string()),
-        "GPT2Attention" => Some("gpt2::MultiHeadAttention".to_string()),
+        "GPT2Attention" | "GPT2SdpaAttention" => Some("gpt2::MultiHeadAttention".to_string()),
         "GPT2MLP" => Some("gpt2::FeedForward".to_string()),
         _ => None,
     }
@@ -140,7 +140,7 @@ pub fn generate_init(
             "pycandle_core::gpt2::TransformerBlock::new(gpt2_cfg, &vb.pp(\"{}\"))?",
             layer_name
         )),
-        "GPT2Attention" => {
+        "GPT2Attention" | "GPT2SdpaAttention" => {
             let dim_val = meta
                 .config
                 .get("n_embd")
