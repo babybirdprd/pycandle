@@ -12,37 +12,35 @@ impl super::Codegen {
         let mut path = Vec::new();
 
         for (_, part) in parts.iter().enumerate() {
-            // Check if we are at an Array index
-            if let Ok(idx) = part.parse::<usize>() {
+            // 1. Check if we are at an Array node (must check Tree)
+            let is_array_access = if let ModuleNode::Array(_) = current {
+                part.parse::<usize>().is_ok()
+            } else {
+                false
+            };
+
+            if is_array_access {
+                let idx = part.parse::<usize>().unwrap();
                 path.push(format!("[{}]", idx));
-                // array traversal
+
+                // Traversal logic for Array
                 if let ModuleNode::Array(arr) = current {
                     if idx < arr.len() {
                         current = &arr[idx];
-                    } else {
-                        // Fallback or error?
-                        // If index out of bounds structurally (unlikely in valid trace),
-                        // we assume homogenous array and just take the first one for type logic,
-                        // but for PATH resolution, we just accept the index.
-                        // But we need 'current' to advance.
-                        if !arr.is_empty() {
-                            current = &arr[0]; // best effort for traversing type info if valid
-                        }
+                    } else if !arr.is_empty() {
+                        current = &arr[0]; // best effort
                     }
                 }
-                continue;
-            }
+            } else {
+                // Normal field traversal (Struct field)
+                path.push(format!(".{}", self.sanitize_name(part)));
 
-            // Normal field traversal
-            path.push(format!(".{}", self.sanitize_name(part)));
-
-            match current {
-                ModuleNode::Struct(children) => {
+                // Traversal logic for Struct
+                if let ModuleNode::Struct(children) = current {
                     if let Some(child) = children.get(*part) {
                         current = child;
                     }
                 }
-                _ => {}
             }
         }
 
