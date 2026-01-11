@@ -385,11 +385,11 @@ impl Cache {
                         .map(|a| self.resolve_fx_arg(a, &var_map))
                         .collect();
 
-                    let call_args = if args.is_empty() {
-                        "/* error: no args for module call */".to_string()
-                    } else {
-                        format!("&{}", args[0])
-                    };
+                    let call_args = args
+                        .iter()
+                        .map(|a| format!("&{}", a))
+                        .collect::<Vec<_>>()
+                        .join(", ");
 
                     // Recursive Path Resolution
                     let target_sanitized = self.resolve_path(root_node, &node.target);
