@@ -3,6 +3,7 @@ use candle_core::{IndexOp, Result, Tensor};
 /// LSTM layer (multi-layer, unidirectional)
 /// Input: (B, T, input_size) if batch_first=true
 /// Output: (output, (h_n, c_n))
+#[derive(Clone, Debug)]
 pub struct LSTM {
     pub weight_ih: Vec<Tensor>, // One per layer: (4*hidden, input_size or hidden_size)
     pub weight_hh: Vec<Tensor>, // One per layer: (4*hidden, hidden_size)
@@ -51,23 +52,23 @@ impl LSTM {
         let device = x.device();
         let dtype = x.dtype();
 
-        let h = Tensor::zeros((self.num_layers, batch, self.hidden_size), dtype, device)?;
-        let c = Tensor::zeros((self.num_layers, batch, self.hidden_size), dtype, device)?;
-        let mut output = x.clone();
+        let mut h_layers = Vec::new();
+        let mut c_layers = Vec::new();
+        let mut current_input = x.clone();
 
         for layer in 0..self.num_layers {
-            let mut h_t = h.i(layer)?;
-            let mut c_t = c.i(layer)?;
-            let mut outputs = Vec::new();
+            let mut h_t = Tensor::zeros((batch, self.hidden_size), dtype, device)?;
+            let mut c_t = Tensor::zeros((batch, self.hidden_size), dtype, device)?;
+            let mut layer_outputs = Vec::new();
 
             for t in 0..seq_len {
-                let x_t = output.i((.., t, ..))?;
+                let x_t = current_input.i((.., t, ..))?;
 
-                // gates = x @ W_ih.T + h @ W_hh.T + b_ih + b_hh
+                // gates = x @ W_ih.T + b_ih + h @ W_hh.T + b_hh
                 let gates = x_t
                     .matmul(&self.weight_ih[layer].t()?)?
-                    .broadcast_add(&h_t.matmul(&self.weight_hh[layer].t()?)?)?
                     .broadcast_add(&self.bias_ih[layer])?
+                    .broadcast_add(&h_t.matmul(&self.weight_hh[layer].t()?)?)?
                     .broadcast_add(&self.bias_hh[layer])?;
 
                 // Split into i, f, g, o (each of size hidden_size)
@@ -77,17 +78,24 @@ impl LSTM {
                 let g_gate = chunks[2].tanh()?;
                 let o_gate = candle_nn::ops::sigmoid(&chunks[3])?;
 
-                c_t = f_gate
+                let next_c_t = f_gate
                     .broadcast_mul(&c_t)?
                     .broadcast_add(&i_gate.broadcast_mul(&g_gate)?)?;
-                h_t = o_gate.broadcast_mul(&c_t.tanh()?)?;
+                let next_h_t = o_gate.broadcast_mul(&next_c_t.tanh()?)?;
 
-                outputs.push(h_t.unsqueeze(1)?);
+                c_t = next_c_t;
+                h_t = next_h_t;
+
+                layer_outputs.push(h_t.unsqueeze(1)?);
             }
 
-            output = Tensor::cat(&outputs, 1)?;
+            current_input = Tensor::cat(&layer_outputs, 1)?;
+            h_layers.push(h_t.unsqueeze(0)?);
+            c_layers.push(c_t.unsqueeze(0)?);
         }
 
-        Ok((output, (h, c)))
+        let h_n = Tensor::cat(&h_layers, 0)?;
+        let c_n = Tensor::cat(&c_layers, 0)?;
+        Ok((current_input, (h_n, c_n)))
     }
 }

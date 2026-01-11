@@ -72,6 +72,7 @@ pub fn load_weight_norm_conv_transpose1d(
 
 /// CausalConv1d: A 1D convolution with causal padding
 /// Ensures that output at time t only depends on inputs at time <= t
+#[derive(Clone, Debug)]
 pub struct CausalConv1d {
     pub conv: candle_nn::Conv1d,
     pub padding: usize,
@@ -114,6 +115,7 @@ impl CausalConv1d {
 }
 
 /// ConvTranspose1d implementation
+#[derive(Clone, Debug)]
 pub struct ConvTranspose1d {
     pub inner: candle_nn::ConvTranspose1d,
 }

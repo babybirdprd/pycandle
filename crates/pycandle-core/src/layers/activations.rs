@@ -1,6 +1,7 @@
 use candle_core::{Result, Tensor};
 
 /// ReLU activation: max(0, x)
+#[derive(Clone, Debug)]
 pub struct ReLU;
 impl ReLU {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -9,6 +10,7 @@ impl ReLU {
 }
 
 /// GELU activation (Gaussian Error Linear Unit)
+#[derive(Clone, Debug)]
 pub struct GELU;
 impl GELU {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -17,6 +19,7 @@ impl GELU {
 }
 
 /// Sigmoid activation: 1 / (1 + exp(-x))
+#[derive(Clone, Debug)]
 pub struct Sigmoid;
 impl Sigmoid {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -25,6 +28,7 @@ impl Sigmoid {
 }
 
 /// Tanh activation
+#[derive(Clone, Debug)]
 pub struct Tanh;
 impl Tanh {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -33,6 +37,7 @@ impl Tanh {
 }
 
 /// ELU activation: x if x > 0, else alpha * (exp(x) - 1)
+#[derive(Clone, Debug)]
 pub struct ELU {
     pub alpha: f64,
 }
@@ -46,6 +51,7 @@ impl ELU {
 }
 
 /// LeakyReLU activation: x if x > 0, else negative_slope * x
+#[derive(Clone, Debug)]
 pub struct LeakyReLU {
     pub negative_slope: f64,
 }
@@ -64,6 +70,7 @@ impl LeakyReLU {
 
 /// Snake activation: x + sin²(αx)/α
 /// Used in neural vocoders like BigVGAN
+#[derive(Clone, Debug)]
 pub struct Snake {
     pub alpha: Tensor,
 }
@@ -85,6 +92,7 @@ impl Snake {
 }
 
 /// Mish activation: x * tanh(softplus(x))
+#[derive(Clone, Debug)]
 pub struct Mish;
 impl Mish {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -96,6 +104,7 @@ impl Mish {
 }
 
 /// SiLU / Swish activation: x * sigmoid(x)
+#[derive(Clone, Debug)]
 pub struct SiLU;
 impl SiLU {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {

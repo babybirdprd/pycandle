@@ -251,12 +251,13 @@ impl Cache {
                                         );
                                         let template = self.generate_init("PLACEHOLDER", meta);
                                         let fixed = template
-                                            .replace("vb.pp(\"PLACEHOLDER\")", &replacement);
+                                            .replace("vb.pp(\"PLACEHOLDER\")", &replacement)
+                                            .replace(")?", ""); // Remove ? from template inside map
                                         impl_code.push_str(&format!("                {}\n", fixed));
                                     }
                                     ModuleNode::Struct(_) => {
                                         let child_type = &child_types[name];
-                                        impl_code.push_str(&format!("                {}::load(vb.pp(&format!(\"{{}}.{{}}\", \"{}\", i)), config)?\n", child_type, name));
+                                        impl_code.push_str(&format!("                {}::load(vb.pp(&format!(\"{{}}.{{}}\", \"{}\", i)), config)\n", child_type, name));
                                     }
                                     _ => impl_code.push_str("todo!(),\n"),
                                 }
@@ -324,9 +325,9 @@ impl Cache {
         // 1. load_from_hub (Root Specific)
         code.push_str("    pub fn load_from_hub(repo: &str, revision: &str, device: &Device, config: Config) -> Result<Self> {
         let api = hf_hub::api::sync::Api::new()?;
-        let repo = api.model(repo.to_string()).with_revision(revision.to_string());
-        let path = repo.get(\"model.safetensors\")?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], device.clone())? };
+        let repo = api.model(repo.to_string()).revision(revision.to_string());
+        let path = repo.get(\"model.safetensors\").map_err(candle_core::Error::wrap)?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], DType::F32, device)? };
         Self::load(vb, &config)
     }
 ");
@@ -695,7 +696,7 @@ impl Cache {
                     .get("alpha")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(1.0);
-                format!("ELU::new({})", alpha)
+                format!("ELU::new({:.1})", alpha)
             }
             "LeakyReLU" => {
                 let slope = meta

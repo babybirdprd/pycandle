@@ -1,6 +1,7 @@
 use candle_core::{Result, Tensor};
 
 /// Dropout layer (inference no-op)
+#[derive(Clone, Debug)]
 pub struct Dropout {
     pub p: f32,
 }
@@ -14,6 +15,7 @@ impl Dropout {
 }
 
 /// Transpose layer (swaps two dimensions)
+#[derive(Clone, Debug)]
 pub struct Transpose {
     pub dim0: usize,
     pub dim1: usize,
@@ -28,6 +30,7 @@ impl Transpose {
 }
 
 /// Sinusoidal Positional Embedding
+#[derive(Clone, Debug)]
 pub struct SinusoidalPosEmb {
     pub dim: usize,
 }
@@ -97,6 +100,7 @@ pub fn load_weight_norm_linear(
 
 /// ReflectionPad1d (1D Reflection Padding)
 /// Input: (B, C, T)
+#[derive(Clone, Debug)]
 pub struct ReflectionPad1d {
     pub padding: usize,
 }
@@ -140,6 +144,7 @@ fn flip_last_dim(x: &Tensor) -> Result<Tensor> {
 
 /// Upsample (Nearest Neighbor 1D)
 /// Input: (B, C, T)
+#[derive(Clone, Debug)]
 pub struct Upsample {
     pub scale_factor: usize,
 }
@@ -162,6 +167,7 @@ impl Upsample {
 /// SineGen: Sine Wave Generator from F0
 /// Input: F0 (B, 1, T)
 /// Output: Sine Waves (B, 1, T * upsample_scale), UV, Noise
+#[derive(Clone, Debug)]
 pub struct SineGen {
     pub harmonic_num: usize,
     pub sine_amp: f64,

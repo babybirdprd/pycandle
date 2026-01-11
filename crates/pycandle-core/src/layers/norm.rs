@@ -2,6 +2,7 @@ use candle_core::{Result, Tensor};
 
 /// BatchNorm1d for inference (uses running statistics)
 /// Input: (B, C, T) or (B, C)
+#[derive(Clone, Debug)]
 pub struct BatchNorm1d {
     pub weight: Tensor, // gamma
     pub bias: Tensor,   // beta
@@ -56,6 +57,7 @@ impl BatchNorm1d {
 
 /// BatchNorm2d for inference (uses running statistics)
 /// Input: (B, C, H, W)
+#[derive(Clone, Debug)]
 pub struct BatchNorm2d {
     pub weight: Tensor,
     pub bias: Tensor,
@@ -95,6 +97,7 @@ impl BatchNorm2d {
 }
 
 /// LlamaRMSNorm: Root Mean Square Layer Normalization
+#[derive(Clone, Debug)]
 pub struct LlamaRMSNorm {
     pub weight: Tensor,
     pub eps: f64,
